@@ -20,16 +20,100 @@ queue, and what's playing — all without leaving the terminal.
 
 ## Install
 
-Requires Rust 1.85+ and audio output (CoreAudio on macOS, ALSA/Pulse/PipeWire on Linux).
+Qobi v0.1.0 installs from source with Cargo. Prebuilt binaries and
+Homebrew/AUR packages are planned — see [CHANGELOG](CHANGELOG.md).
+
+### 1. Install Rust
+
+macOS and Linux both use [rustup](https://rustup.rs/):
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+macOS also needs the Xcode command line tools (CoreAudio headers):
+
+```sh
+xcode-select --install
+```
+
+Linux needs ALSA development headers at **build time**
+(runtime works with ALSA, PulseAudio, or PipeWire):
+
+```sh
+# Debian / Ubuntu
+sudo apt install build-essential libasound2-dev pkg-config
+# Arch Linux
+sudo pacman -S base-devel alsa-lib
+# Fedora
+sudo dnf install gcc alsa-lib-devel pkgconf-pkg-config
+```
+
+### 2. Build and install Qobi
 
 ```sh
 git clone git@github.com:mehrphld-debug/Qobi-TUI-player.git
 cd Qobi-TUI-player
-cargo build --release
-./target/release/qobi ~/Music
+cargo install --path . --locked
 ```
 
-(Homebrew + AUR packages are planned — see [CHANGELOG](CHANGELOG.md).)
+This places the `qobi` binary in `~/.cargo/bin/`. Make sure it is on your `PATH`
+(Cargo's installer usually does this for new shells; otherwise add it once):
+
+```sh
+# macOS (zsh) and most Linux shells — add to ~/.zshrc or ~/.bashrc:
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Verify:
+
+```sh
+qobi --version   # → qobi 0.1.0
+```
+
+Point it at music:
+
+```sh
+qobi ~/Music
+```
+
+### 3. Where things live
+
+| What | Location |
+|------|----------|
+| Binary | `~/.cargo/bin/qobi` |
+| Settings | `~/.config/qobi/config.toml` |
+| Scan + cover cache | `~/.config/qobi/cache/` |
+| Single-instance socket | `~/.config/qobi/qobi.sock` |
+
+First run with no arguments and no configured directory prints a hint —
+just run `qobi <dir>` or `qobi <file>` once to get going.
+
+### 4. Updating
+
+```sh
+cd Qobi-TUI-player
+git pull origin master
+cargo install --path . --locked
+```
+
+### 5. Uninstall
+
+Remove the binary (both OSes):
+
+```sh
+cargo uninstall qobi
+# or, if installed manually: rm ~/.cargo/bin/qobi
+```
+
+Optionally remove settings, cache, and socket (both OSes):
+
+```sh
+rm -rf ~/.config/qobi
+```
+
+That is everything Qobi creates — no background services, no daemons,
+no files outside `~/.cargo/bin` and `~/.config/qobi`.
 
 ## Usage
 
