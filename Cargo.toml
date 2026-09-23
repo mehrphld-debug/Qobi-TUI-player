@@ -1,0 +1,29 @@
+[package]
+name = "qobi"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "qobi"
+path = "src/main.rs"
+
+[lib]
+name = "qobi_lib"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
+image = "0.25.10"
+lofty = "0.25.4"
+ratatui = "0.30.2"
+rodio = "0.22.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+walkdir = "2.5.0"
