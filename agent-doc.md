@@ -1,10 +1,9 @@
 # Qobi Project — Agent Documentation
 
 ## Current Status
-- Chunks 0 + E + B + A implemented. Requirements: `sys-p/0.md`, `sys-p/1.md`. Optimized plan: `sys-p/2.md`.
-- Dev-team review done 2026-09-23. Decisions locked in `PROJECT-CONTEXT.md`.
-- Architecture.md + Chunk-Map.md done 2026-09-23 (single-instance enqueue, lazy index, TUI tokens, A-J order).
-- Next: v0.1.0 tag — README + shortcut docs + release notes (brew/AUR), final cross-gates.
+- **v0.1.0 released 2026-09-23** (tag `v0.1.0`, pushed to `origin/master`): README + CHANGELOG shipped, release binary verified live on pty.
+- Requirements: `sys-p/0.md`, `sys-p/1.md`. Optimized plan: `sys-p/2.md`. Decisions locked in `PROJECT-CONTEXT.md`.
+- Next: v0.2 planning — live spectrum EQ, native Kitty/iTerm art, settings UI, dedup, brew/AUR, 20k bench, terminal matrix.
 
 ## Last Known Good State
 - Chunks 0 + E + B + A + C-min + D + F-basic + H-min implemented and green 2026-09-23: 62 tests pass (+1 ignored hw probe), `clippy -D warnings` clean, `fmt --check` clean.
