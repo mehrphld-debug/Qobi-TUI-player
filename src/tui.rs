@@ -207,9 +207,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("→ / ←", "seek ±5s"),
     ("↑ / ↓", "navigate"),
     ("Enter", "play selected"),
+    ("Tab", "now playing / queue"),
     ("/", "search"),
     ("+", "- volume"),
-    ("e", "toggle equalizer"),
+    ("e", "toggle eq preview"),
     ("a", "toggle art"),
     ("c", "clear queue"),
     ("s", "shuffle queue"),
@@ -231,7 +232,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(rows), area);
 }
 
-/// Render one full frame. Never sets a background: transparency is structural.
+/// Render one full frame. Never sets a background outside half-block art
+/// cells: transparency is structural everywhere else.
 pub fn render(frame: &mut Frame, state: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -250,7 +252,7 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     let status = match &state.toast {
         Some(t) => Line::from(Span::styled(t.clone(), warn())),
         None => Line::from(Span::styled(
-            "space play/pause · / search · ? help · q quit",
+            "space play/pause · tab queue · / search · ? help · q quit",
             dim(),
         )),
     };
@@ -289,7 +291,12 @@ mod tests {
 
     fn assert_transparent(buf: &ratatui::buffer::Buffer) {
         for cell in buf.content.iter() {
-            assert_eq!(cell.bg, Color::Reset, "background fill breaks transparency");
+            // Half-block art cells are the one sanctioned bg exception (see
+            // art::ArtImage::to_lines); everything else must stay Reset.
+            assert!(
+                cell.bg == Color::Reset || cell.symbol() == "▀",
+                "background fill breaks transparency outside art cells"
+            );
         }
     }
 
@@ -365,7 +372,7 @@ mod tests {
         s.view = View::Help;
         let text = text_of(&draw(&s, 80, 24));
         for key in [
-            "space", "seek", "search", "volume", "quit", "clear", "shuffle", "repeat",
+            "space", "seek", "search", "volume", "quit", "clear", "shuffle", "repeat", "Tab",
         ] {
             assert!(text.contains(key), "{key} missing from help:\n{text}");
         }
@@ -388,21 +395,22 @@ mod tests {
 
     #[test]
     fn art_renders_centered_and_transparent() {
-        use crate::art::placeholder;
+        use crate::art::{MOSAIC_H, MOSAIC_PIXEL_H, MOSAIC_W, placeholder};
         let mut s = demo_state();
         s.view = View::NowPlaying;
-        s.art = placeholder(42, 24, 12).to_lines(true);
+        s.art = placeholder(42, MOSAIC_W, MOSAIC_PIXEL_H).to_lines(true);
+        assert_eq!(s.art.len(), MOSAIC_H as usize, "24x24 px → 12 cell rows");
         let buf = draw(&s, 80, 24);
         assert_transparent(&buf);
-        // 24×12 mosaic cells plus the two █ in the eq preview row.
-        let on = text_of(&buf).chars().filter(|&c| c == '█').count();
-        assert!(on > 200, "mosaic missing (only {on} cells)");
+        // The whole 24x12 mosaic renders as half-block cells.
+        let on = text_of(&buf).chars().filter(|&c| c == '▀').count();
+        assert_eq!(on, (MOSAIC_W * MOSAIC_H) as usize, "mosaic cells missing");
         s.art_enabled = false;
         let off = text_of(&draw(&s, 80, 24))
             .chars()
-            .filter(|&c| c == '█')
+            .filter(|&c| c == '▀')
             .count();
-        assert_eq!(off, 2, "toggle must hide art, leaving only eq preview");
+        assert_eq!(off, 0, "toggle must hide art entirely");
     }
 
     #[test]

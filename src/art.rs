@@ -10,9 +10,15 @@ use ratatui::{
 /// Disk cache budget for extracted covers (Chunk-Map §F).
 pub const ART_CACHE_CAP_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Mosaic size in terminal cells (1 cell = 1 pixel, full-block fg only).
+/// Mosaic size in terminal **cells**.
 pub const MOSAIC_W: u32 = 24;
 pub const MOSAIC_H: u32 = 12;
+
+/// Pixel sampling height: terminal cells are ~1:2 (w:h), so every cell
+/// renders **two** pixel rows via half-blocks. Sampling at
+/// `MOSAIC_W × MOSAIC_PIXEL_H` and pairing rows makes pixels square on
+/// screen — one-pixel-per-cell was a 2× vertical stretch (the "pixel mess").
+pub const MOSAIC_PIXEL_H: u32 = MOSAIC_H * 2;
 
 /// Image-capable terminal protocols, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +52,22 @@ pub fn detect_protocol_from(env: &HashMap<String, String>) -> ArtProtocol {
 /// Detect from the real process environment.
 pub fn detect_protocol() -> ArtProtocol {
     detect_protocol_from(&std::env::vars().collect())
+}
+
+/// True when the env advertises 24-bit color (`COLORTERM`), which lets the
+/// mosaic use exact RGB instead of the coarse 256-color cube.
+pub fn detect_truecolor_from(env: &HashMap<String, String>) -> bool {
+    env.get("COLORTERM")
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v.contains("truecolor") || v.contains("24bit") || v.contains("24-bit")
+        })
+        .unwrap_or(false)
+}
+
+/// Detect truecolor support from the real process environment.
+pub fn truecolor() -> bool {
+    detect_truecolor_from(&std::env::vars().collect())
 }
 
 /// True when colors must be suppressed (`NO_COLOR` present, any value).
@@ -143,34 +165,62 @@ pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
 }
 
 impl ArtImage {
-    /// Render rows of full-block cells. `colored=false` (NO_COLOR) uses
-    /// density runes with default fg — still no background anywhere.
+    /// Render rows of half-block cells: each cell carries two pixel rows
+    /// (fg = upper, bg = lower). The **only** background Qobi ever paints is
+    /// inside these image cells — the terminal background still shows through
+    /// everywhere else. `colored=false` (NO_COLOR) keeps density runes with
+    /// default fg and no background at all.
     pub fn to_lines(&self, colored: bool) -> Vec<Line<'static>> {
-        self.pixels
-            .chunks(self.width as usize)
-            .map(|row| {
-                let spans: Vec<Span> = row
-                    .iter()
-                    .map(|&(r, g, b)| {
-                        if colored {
-                            Span::styled(
-                                "█",
-                                Style::default().fg(Color::Indexed(rgb_to_ansi256(r, g, b))),
-                            )
-                        } else {
-                            let lum = u16::from(r) + u16::from(g) + u16::from(b);
-                            let ch = match lum / 3 {
-                                0..=64 => '░',
-                                65..=170 => '▒',
-                                _ => '▓',
-                            };
-                            Span::raw(ch.to_string())
-                        }
-                    })
-                    .collect();
-                Line::from(spans)
-            })
-            .collect()
+        self.to_lines_with(colored, truecolor())
+    }
+
+    /// Same, with explicit truecolor choice (pure — testable without a
+    /// live terminal). Truecolor terminals get exact RGB; everything else
+    /// falls back to the 256-color cube.
+    pub fn to_lines_with(&self, colored: bool, use_truecolor: bool) -> Vec<Line<'static>> {
+        let w = self.width as usize;
+        let px = |x: usize, y: usize| -> (u8, u8, u8) {
+            self.pixels.get(y * w + x).copied().unwrap_or((0, 0, 0))
+        };
+        let color_of = |(r, g, b): (u8, u8, u8)| {
+            if use_truecolor {
+                Color::Rgb(r, g, b)
+            } else {
+                Color::Indexed(rgb_to_ansi256(r, g, b))
+            }
+        };
+        let mut lines = Vec::new();
+        let mut y = 0;
+        while y < self.height as usize {
+            let mut spans: Vec<Span> = Vec::with_capacity(w);
+            for x in 0..w {
+                let top = px(x, y);
+                let bottom = px(x, y + 1);
+                if colored {
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::default().fg(color_of(top)).bg(color_of(bottom)),
+                    ));
+                } else {
+                    let lum = (u16::from(top.0)
+                        + u16::from(top.1)
+                        + u16::from(top.2)
+                        + u16::from(bottom.0)
+                        + u16::from(bottom.1)
+                        + u16::from(bottom.2))
+                        / 6;
+                    let ch = match lum {
+                        0..=64 => '░',
+                        65..=170 => '▒',
+                        _ => '▓',
+                    };
+                    spans.push(Span::raw(ch.to_string()));
+                }
+            }
+            lines.push(Line::from(spans));
+            y += 2;
+        }
+        lines
     }
 }
 
@@ -353,19 +403,78 @@ mod tests {
     }
 
     #[test]
-    fn mosaic_lines_use_fg_only() {
-        let img = placeholder(7, 4, 2);
-        for line in img.to_lines(true) {
+    fn half_block_mosaic_pairs_two_pixel_rows_per_cell() {
+        // 2x4 pixels → 2 cell rows, each column pairing upper+lower pixels.
+        let img = ArtImage {
+            width: 2,
+            height: 4,
+            pixels: vec![
+                (255, 0, 0),
+                (255, 0, 0), // row 0 (top half of cell row 0)
+                (0, 255, 0),
+                (0, 255, 0), // row 1 (bottom half of cell row 0)
+                (0, 0, 255),
+                (0, 0, 255), // row 2
+                (255, 255, 0),
+                (255, 255, 0), // row 3
+            ],
+        };
+        let lines = img.to_lines_with(true, true);
+        assert_eq!(lines.len(), 2, "4 pixel rows → 2 cell rows");
+        let spans0 = &lines[0].spans;
+        assert_eq!(spans0[0].content, "▀");
+        assert_eq!(spans0[0].style.fg, Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(spans0[0].style.bg, Some(Color::Rgb(0, 255, 0)));
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Rgb(0, 0, 255)));
+        assert_eq!(lines[1].spans[0].style.bg, Some(Color::Rgb(255, 255, 0)));
+    }
+
+    #[test]
+    fn indexed_fallback_quantizes_instead_of_truecolor() {
+        let img = ArtImage {
+            width: 1,
+            height: 2,
+            pixels: vec![(10, 20, 30), (10, 20, 30)],
+        };
+        let lines = img.to_lines_with(true, false);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Indexed(16)));
+    }
+
+    #[test]
+    fn odd_pixel_height_pads_missing_lower_row_with_black() {
+        let img = ArtImage {
+            width: 1,
+            height: 3,
+            pixels: vec![(255, 0, 0), (0, 255, 0), (9, 9, 9)],
+        };
+        let lines = img.to_lines_with(true, true);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Rgb(9, 9, 9)));
+        assert_eq!(lines[1].spans[0].style.bg, Some(Color::Rgb(0, 0, 0)));
+    }
+
+    #[test]
+    fn monochrome_mosaic_keeps_no_background() {
+        let img = placeholder(7, 4, 4);
+        for line in img.to_lines_with(false, true) {
             for span in &line.spans {
-                assert!(span.style.bg.is_none(), "mosaic must not set bg");
+                assert!(span.style.bg.is_none(), "monochrome must not set bg");
+                assert!(span.style.fg.is_none(), "monochrome must not set fg");
             }
         }
-        // Monochrome: default fg, density runes.
         let text: String = img
-            .to_lines(false)
+            .to_lines_with(false, true)
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
             .collect();
         assert!(text.chars().all(|c| "░▒▓".contains(c)));
+    }
+
+    #[test]
+    fn mosaic_sample_size_matches_cell_aspect() {
+        // 24x24 pixels render as 24x12 cells ≈ square on screen.
+        assert_eq!(MOSAIC_PIXEL_H, 2 * MOSAIC_H);
+        let img = placeholder(1, MOSAIC_W, MOSAIC_PIXEL_H);
+        assert_eq!(img.to_lines_with(true, false).len(), MOSAIC_H as usize);
     }
 }

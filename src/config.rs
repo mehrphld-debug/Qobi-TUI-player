@@ -82,6 +82,16 @@ impl Config {
         self
     }
 
+    pub fn with_eq_enabled(mut self, on: bool) -> Self {
+        self.eq_enabled = on;
+        self
+    }
+
+    pub fn with_art_enabled(mut self, on: bool) -> Self {
+        self.art_enabled = on;
+        self
+    }
+
     pub fn config_path() -> Result<PathBuf, crate::error::QobiError> {
         crate::ipc::qobi_dir().map(|d| d.join("config.toml"))
     }

@@ -208,7 +208,7 @@ pub fn save_cache(tracks: &[Track], cache_path: &Path) -> std::io::Result<()> {
     let cache = IndexCache {
         entries: tracks.iter().map(|t| (t.path.clone(), t.clone())).collect(),
     };
-    let raw = serde_json::to_vec(&cache).expect("cache serializes");
+    let raw = serde_json::to_vec(&cache).map_err(std::io::Error::other)?;
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -266,6 +266,15 @@ impl Queue {
     /// Cursor index for the UI (clamped).
     pub fn selected_index(&self) -> usize {
         self.cursor.min(self.tracks.len().saturating_sub(1))
+    }
+
+    /// Drop the cursor onto a specific index (search navigation).
+    pub fn set_cursor(&mut self, index: usize) {
+        if self.tracks.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        self.cursor = index.min(self.tracks.len() - 1);
     }
 
     /// Move the cursor by a signed delta, clamped to `[0, len-1]`.

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::QobiError;
 
@@ -34,26 +34,59 @@ pub fn socket_path() -> Result<PathBuf, QobiError> {
 
 /// Bind the socket or detect a live primary.
 /// A leftover socket file with nobody listening is reclaimed (stale takeover).
+///
+/// Hardening: the state dir is `0700` and the socket `0600` so only this
+/// user can connect, regardless of umask.
 pub async fn resolve_role(sock: &Path) -> Result<Role, QobiError> {
     if let Some(parent) = sock.parent() {
         tokio::fs::create_dir_all(parent).await?;
+        restrict_dir(parent);
     }
     match tokio::net::UnixListener::bind(sock) {
-        Ok(listener) => Ok(Role::Primary(listener)),
+        Ok(listener) => {
+            restrict_socket(sock);
+            Ok(Role::Primary(listener))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             if is_live(sock).await {
                 Ok(Role::Secondary)
             } else {
                 // Stale file: nobody listening. Reclaim and retry once.
                 let _ = tokio::fs::remove_file(sock).await;
-                tokio::net::UnixListener::bind(sock)
-                    .map(Role::Primary)
-                    .map_err(QobiError::Io)
+                let listener = tokio::net::UnixListener::bind(sock).map_err(QobiError::Io)?;
+                restrict_socket(sock);
+                Ok(Role::Primary(listener))
             }
         }
         Err(e) => Err(QobiError::Io(e)),
     }
 }
+
+/// State dir is private to this user, independent of umask.
+fn restrict_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// Only this user may connect to the IPC socket, independent of umask.
+fn restrict_socket(sock: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = sock;
+}
+
+/// Upper bound on one IPC line (Architecture §2: 1 MiB). Larger messages
+/// are dropped instead of being fully buffered.
+pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// True when something answers on the socket. Sends a `Ping` (rather than a
 /// bare connect) so the primary's accept loop never sees a spurious EOF.
@@ -75,14 +108,21 @@ pub async fn send_message(sock: &Path, msg: &IpcMessage) -> Result<(), QobiError
     Ok(())
 }
 
-/// Read a single message; `Ok(None)` means a corrupt line (log + continue, never crash).
+/// Read a single message; `Ok(None)` means a corrupt or oversized line
+/// (log + continue, never crash). Reading is capped at
+/// [`MAX_MESSAGE_BYTES`] + 1 so a hostile line cannot balloon memory.
 pub async fn read_message<S>(stream: &mut S) -> Result<Option<IpcMessage>, QobiError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
+    let mut limited = stream.take((MAX_MESSAGE_BYTES + 1) as u64);
     let mut line = String::new();
-    let n = BufReader::new(stream).read_line(&mut line).await?;
+    let n = BufReader::new(&mut limited).read_line(&mut line).await?;
     if n == 0 {
+        return Ok(None);
+    }
+    if line.len() > MAX_MESSAGE_BYTES {
+        tracing::warn!("ipc: oversized message dropped ({} bytes)", line.len());
         return Ok(None);
     }
     match serde_json::from_str(line.trim()) {
@@ -163,6 +203,38 @@ mod tests {
         let mut stream = stream;
         let got = read_message(&mut stream).await.expect("read must not err");
         assert_eq!(got, None);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn oversized_message_is_dropped_without_error() {
+        // The duplex buffer must fit the whole message: with a small buffer
+        // the writer blocks waiting for a reader that only starts after the
+        // write completes (deadlock — this test used to hang forever).
+        let (mut client, mut server) = tokio::io::duplex(MAX_MESSAGE_BYTES + 4096);
+        let big = format!("{}\n", "a".repeat(MAX_MESSAGE_BYTES + 1024));
+        client.write_all(big.as_bytes()).await.expect("write");
+        drop(client);
+        let got = read_message(&mut server).await.expect("read must not err");
+        assert_eq!(got, None, "oversized line must be dropped");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn socket_and_dir_are_private_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let sock = tmp_sock("perms");
+        let Role::Primary(listener) = resolve_role(&sock).await.expect("primary") else {
+            panic!("expected primary");
+        };
+        drop(listener);
+        let mode = std::fs::metadata(&sock).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "socket must be 0600, got {:o}", mode);
+        let dir_mode = std::fs::metadata(sock.parent().expect("dir"))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "dir must be 0700");
         let _ = std::fs::remove_file(&sock);
     }
 

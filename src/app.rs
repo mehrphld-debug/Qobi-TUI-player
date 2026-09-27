@@ -1,12 +1,16 @@
+use crate::config::Config;
 use crate::engine::{AudioSink, Engine, SEEK_STEP};
 use crate::input::Action;
 use crate::ipc::IpcMessage;
-use crate::library::{Queue, Track, save_cache, scan_with_cache, track_from_file};
+use crate::library::{Queue, Track, track_from_file};
 use crate::tui::{TrackInfo, UiState, View};
 
 use ratatui::text::Line;
 
 const VOLUME_STEP: f32 = 0.05;
+
+/// Toast lifetime (Architecture §2: enqueue toasts live 3s).
+const TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Repeat behavior at end of track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,11 +44,17 @@ impl RepeatMode {
 pub struct App<S: AudioSink> {
     engine: Engine<S>,
     queue: Queue,
+    config: Config,
+    /// Set when the config needs persisting; the UI loop drains it via
+    /// [`App::take_dirty_config`] and saves atomically.
+    config_dirty: bool,
     view: View,
     prev_view: View,
     search: Option<String>,
     toast: Option<String>,
+    toast_at: Option<std::time::Instant>,
     art_enabled: bool,
+    eq_enabled: bool,
     repeat: RepeatMode,
     cache_path: std::path::PathBuf,
     /// Memoized cover lines: (track key, lines). Decoding runs only on track change.
@@ -52,19 +62,51 @@ pub struct App<S: AudioSink> {
 }
 
 impl<S: AudioSink> App<S> {
-    pub fn new(engine: Engine<S>, queue: Queue, cache_path: std::path::PathBuf) -> Self {
+    pub fn new(
+        engine: Engine<S>,
+        queue: Queue,
+        config: Config,
+        cache_path: std::path::PathBuf,
+    ) -> Self {
+        let eq_enabled = config.eq_enabled();
+        let art_enabled = config.art_enabled();
         Self {
             engine,
             queue,
+            config,
+            config_dirty: false,
             view: View::NowPlaying,
             prev_view: View::NowPlaying,
             search: None,
             toast: None,
-            art_enabled: true,
+            toast_at: None,
+            art_enabled,
+            eq_enabled,
             repeat: RepeatMode::Off,
             cache_path,
             art_memo: std::cell::RefCell::new((None, Vec::new())),
         }
+    }
+
+    /// Mark the config for persistence on the next UI-loop drain.
+    fn mark_config_dirty(&mut self) {
+        self.config_dirty = true;
+    }
+
+    /// Take the pending config snapshot for saving (resets the dirty flag).
+    pub fn take_dirty_config(&mut self) -> Option<Config> {
+        if self.config_dirty {
+            self.config_dirty = false;
+            Some(self.config.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Toast with a 3s lifetime (cleared by [`App::tick`]).
+    fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some(msg.into());
+        self.toast_at = Some(std::time::Instant::now());
     }
 
     /// Handle one action. Returns true when the app should quit.
@@ -73,19 +115,24 @@ impl<S: AudioSink> App<S> {
             Action::TogglePlay => self.engine.toggle(),
             Action::SeekForward => self.engine.seek_by(SEEK_STEP, true),
             Action::SeekBackward => self.engine.seek_by(SEEK_STEP, false),
-            Action::CursorUp => self.queue.move_cursor(-1),
-            Action::CursorDown => self.queue.move_cursor(1),
+            Action::CursorUp => self.move_cursor(-1),
+            Action::CursorDown => self.move_cursor(1),
             Action::PlaySelected => self.play_selected(),
             Action::VolumeUp => self.bump_volume(VOLUME_STEP),
             Action::VolumeDown => self.bump_volume(-VOLUME_STEP),
             Action::ToggleEq => {
-                // Persisted in Chunk I; ack only.
-                self.toast = Some("eq toggle lands in Chunk I".to_string());
+                // Toggles the eq preview row now; live spectrum bars stay in v0.2.
+                self.eq_enabled = !self.eq_enabled;
+                self.config = self.config.clone().with_eq_enabled(self.eq_enabled);
+                self.mark_config_dirty();
             }
             Action::ToggleArt => {
                 self.art_enabled = !self.art_enabled;
+                self.config = self.config.clone().with_art_enabled(self.art_enabled);
+                self.mark_config_dirty();
             }
             Action::ToggleHelp => self.toggle_help(),
+            Action::CycleView => self.cycle_view(),
             Action::StartSearch => {
                 self.search = Some(String::new());
                 self.view = View::Queue;
@@ -94,25 +141,27 @@ impl<S: AudioSink> App<S> {
                 if let Some(q) = self.search.as_mut() {
                     q.push(c);
                 }
+                self.snap_cursor_to_filter();
             }
             Action::SearchBackspace => {
                 if let Some(q) = self.search.as_mut() {
                     q.pop();
                 }
+                self.snap_cursor_to_filter();
             }
             Action::ExitSearch => self.search = None,
             Action::ClearQueue => {
                 self.queue.clear();
-                self.toast = Some("queue cleared".to_string());
+                self.set_toast("queue cleared");
             }
             Action::ShuffleQueue => {
                 let current = self.engine.current().cloned();
                 self.queue.shuffle(current.as_ref());
-                self.toast = Some("queue shuffled".to_string());
+                self.set_toast("queue shuffled");
             }
             Action::CycleRepeat => {
                 self.repeat = self.repeat.cycle();
-                self.toast = Some(format!("repeat: {}", self.repeat.label()));
+                self.set_toast(format!("repeat: {}", self.repeat.label()));
             }
             Action::Quit => return true,
             Action::Ignored => {}
@@ -121,6 +170,9 @@ impl<S: AudioSink> App<S> {
     }
 
     /// IPC enqueue: append + toast, never steal the current view (D2).
+    /// `EnqueueDir` is handled upstream: the UI loop runs the scan on the
+    /// blocking pool and feeds the result back via [`App::enqueue_scanned`],
+    /// so a big directory never freezes the interface.
     pub fn handle_ipc(&mut self, msg: &IpcMessage) {
         match msg {
             IpcMessage::Ping => {}
@@ -131,7 +183,7 @@ impl<S: AudioSink> App<S> {
                     .collect();
                 let n = found.len();
                 self.queue.append(found);
-                self.toast = Some(if n == 1 {
+                self.set_toast(if n == 1 {
                     format!(
                         "Queued: {}",
                         paths[0]
@@ -144,15 +196,19 @@ impl<S: AudioSink> App<S> {
                 });
             }
             IpcMessage::EnqueueDir { path } => {
-                let (tracks, _) = scan_with_cache(path, &self.cache_path);
-                let n = tracks.len();
-                if let Err(e) = save_cache(&tracks, &self.cache_path) {
-                    tracing::warn!("cache save failed: {e}");
-                }
-                self.queue.append(tracks);
-                self.toast = Some(format!("Queued {n} tracks"));
+                tracing::warn!(
+                    "unexpected sync dir enqueue (ignored; async path handles it): {}",
+                    path.display()
+                );
             }
         }
+    }
+
+    /// Append tracks produced by the background dir scan (IPC enqueue-dir).
+    pub fn enqueue_scanned(&mut self, tracks: Vec<Track>) {
+        let n = tracks.len();
+        self.queue.append(tracks);
+        self.set_toast(format!("Queued {n} tracks"));
     }
 
     /// True while search mode captures typing.
@@ -160,10 +216,17 @@ impl<S: AudioSink> App<S> {
         self.search.is_some()
     }
 
-    /// Periodic housekeeping: end-of-track → repeat/advance per [`RepeatMode`].
-    /// `Off` stops on the last track; `All` wraps to the head; `One` replays.
+    /// Periodic housekeeping: expire toasts, then end-of-track →
+    /// repeat/advance per [`RepeatMode`]. `Off` stops on the last track;
+    /// `All` wraps to the head; `One` replays.
     pub fn tick(&mut self) {
         use crate::engine::PlayerState;
+        if let Some(at) = self.toast_at
+            && at.elapsed() >= TOAST_DURATION
+        {
+            self.toast = None;
+            self.toast_at = None;
+        }
         self.engine.poll_end();
         if self.engine.state() != PlayerState::Ended {
             return;
@@ -207,7 +270,7 @@ impl<S: AudioSink> App<S> {
                 break;
             };
             if let Err(e) = self.engine.play_track(track.clone()) {
-                self.toast = Some(format!("Skipping {}: {e:#}", track.display_filename()));
+                self.set_toast(format!("Skipping {}: {e:#}", track.display_filename()));
                 self.queue.move_cursor(1);
                 if self.queue.selected_index() == idx {
                     break; // cursor cannot advance: avoid a loop
@@ -245,10 +308,7 @@ impl<S: AudioSink> App<S> {
             .iter()
             .map(|t| t.display_filename())
             .collect();
-        let cursor = self
-            .queue
-            .selected_index()
-            .min(names.len().saturating_sub(1));
+        let cursor = self.displayed_cursor();
         UiState {
             view: self.view,
             track,
@@ -258,7 +318,7 @@ impl<S: AudioSink> App<S> {
             queue: names,
             cursor,
             toast: self.toast.clone(),
-            eq_enabled: true,
+            eq_enabled: self.eq_enabled,
             search_query: self.search.clone(),
             art: self.resolve_art(),
             art_enabled: self.art_enabled,
@@ -270,8 +330,8 @@ impl<S: AudioSink> App<S> {
     /// placeholder. Respects the visibility toggle.
     fn resolve_art(&self) -> Vec<Line<'static>> {
         use crate::art::{
-            ART_CACHE_CAP_BYTES, MOSAIC_H, MOSAIC_W, evict_over_cap, extract_embedded, load_cached,
-            monochrome, placeholder, store_cached, thumbnail,
+            ART_CACHE_CAP_BYTES, MOSAIC_PIXEL_H, MOSAIC_W, evict_over_cap, extract_embedded,
+            load_cached, monochrome, placeholder, store_cached, thumbnail,
         };
         let Some(track) = self.engine.current() else {
             return Vec::new();
@@ -305,26 +365,81 @@ impl<S: AudioSink> App<S> {
                 Some(raw)
             })
         });
+        // Sample at cell aspect (24x24 px → 24x12 cells): half-blocks render
+        // two pixel rows per cell so the cover is square, not stretched.
         let img = bytes
             .as_deref()
-            .and_then(|b| thumbnail(b, MOSAIC_W, MOSAIC_H))
-            .unwrap_or_else(|| placeholder(track.stable_id(), MOSAIC_W, MOSAIC_H));
+            .and_then(|b| thumbnail(b, MOSAIC_W, MOSAIC_PIXEL_H))
+            .unwrap_or_else(|| placeholder(track.stable_id(), MOSAIC_W, MOSAIC_PIXEL_H));
         let lines = img.to_lines(!monochrome());
         *self.art_memo.borrow_mut() = (Some(key), lines.clone());
         lines
     }
 
-    fn filtered_tracks(&self) -> Vec<&Track> {
-        let all: Vec<&Track> = (0..self.queue.len())
-            .filter_map(|i| self.queue.get(i))
-            .collect();
+    /// Queue indices that match the active search filter (all when not filtering).
+    fn filtered_indices(&self) -> Vec<usize> {
+        let all: Vec<usize> = (0..self.queue.len()).collect();
         let Some(q) = self.search.as_deref().filter(|q| !q.is_empty()) else {
             return all;
         };
         let needle = q.to_lowercase();
         all.into_iter()
-            .filter(|t| t.display_filename().to_lowercase().contains(&needle))
+            .filter(|&i| {
+                self.queue
+                    .get(i)
+                    .map(|t| t.display_filename().to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+            })
             .collect()
+    }
+
+    fn filtered_tracks(&self) -> Vec<&Track> {
+        self.filtered_indices()
+            .into_iter()
+            .filter_map(|i| self.queue.get(i))
+            .collect()
+    }
+
+    /// Cursor row **as rendered**: the position of the selected track inside
+    /// the (possibly filtered) list — never an index into a different list.
+    fn displayed_cursor(&self) -> usize {
+        if self.search.as_deref().is_some_and(|q| !q.is_empty()) {
+            self.filtered_indices()
+                .iter()
+                .position(|&i| i == self.queue.selected_index())
+                .unwrap_or(0)
+        } else {
+            self.queue.selected_index()
+        }
+    }
+
+    /// Move the cursor one row of the **rendered** list. With an active filter,
+    /// this walks the matching subset only (bug fix: the cursor used to step
+    /// through the unfiltered queue, so Enter played a track that was not
+    /// the one under the marker).
+    fn move_cursor(&mut self, delta: i32) {
+        if self.search.as_deref().is_some_and(|q| !q.is_empty()) {
+            let idxs = self.filtered_indices();
+            if idxs.is_empty() {
+                return;
+            }
+            let pos = idxs
+                .iter()
+                .position(|&i| i == self.queue.selected_index())
+                .unwrap_or(0);
+            let next = ((pos as i64) + i64::from(delta)).clamp(0, (idxs.len() - 1) as i64) as usize;
+            self.queue.set_cursor(idxs[next]);
+        } else {
+            self.queue.move_cursor(delta);
+        }
+    }
+
+    /// After a filter edit, keep the selection inside the visible subset.
+    fn snap_cursor_to_filter(&mut self) {
+        let idxs = self.filtered_indices();
+        if !idxs.is_empty() && !idxs.contains(&self.queue.selected_index()) {
+            self.queue.set_cursor(idxs[0]);
+        }
     }
 
     fn play_selected(&mut self) {
@@ -332,15 +447,17 @@ impl<S: AudioSink> App<S> {
         match self.queue.get(idx).cloned() {
             Some(track) => {
                 if let Err(e) = self.engine.play_track(track.clone()) {
-                    self.toast = Some(format!("Cannot play {}: {e:#}", track.display_filename()));
+                    self.set_toast(format!("Cannot play {}: {e:#}", track.display_filename()));
                 }
             }
-            None => self.toast = Some("queue empty".to_string()),
+            None => self.set_toast("queue empty"),
         }
     }
 
     fn bump_volume(&mut self, delta: f32) {
         self.engine.set_volume(self.engine.volume() + delta);
+        self.config = self.config.clone().with_volume(self.engine.volume());
+        self.mark_config_dirty();
     }
 
     fn toggle_help(&mut self) {
@@ -349,6 +466,16 @@ impl<S: AudioSink> App<S> {
         } else {
             self.prev_view = self.view;
             self.view = View::Help;
+        }
+    }
+
+    /// `Tab` cycles the content views. Without this the Queue view is only
+    /// reachable via search — enqueued tracks would be invisible.
+    fn cycle_view(&mut self) {
+        match self.view {
+            View::NowPlaying => self.view = View::Queue,
+            View::Queue => self.view = View::NowPlaying,
+            View::Help => self.view = self.prev_view,
         }
     }
 }
@@ -376,7 +503,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmp");
         let engine = Engine::new(MockSink::with_duration(Duration::from_secs(200)), 1.0);
         let cache = dir.join("cache.json");
-        (App::new(engine, Queue::default(), cache), dir)
+        (
+            App::new(engine, Queue::default(), Config::default(), cache),
+            dir,
+        )
     }
 
     #[test]
@@ -397,6 +527,20 @@ mod tests {
         let (mut a, _) = app();
         assert!(a.handle_action(Action::Quit));
         assert!(!a.handle_action(Action::Ignored));
+    }
+
+    #[test]
+    fn tab_cycles_content_views_and_leaves_help() {
+        let (mut a, _) = app();
+        assert_eq!(a.sync_ui().view, View::NowPlaying);
+        a.handle_action(Action::CycleView);
+        assert_eq!(a.sync_ui().view, View::Queue);
+        a.handle_action(Action::CycleView);
+        assert_eq!(a.sync_ui().view, View::NowPlaying);
+        a.handle_action(Action::ToggleHelp);
+        assert_eq!(a.sync_ui().view, View::Help);
+        a.handle_action(Action::CycleView);
+        assert_eq!(a.sync_ui().view, View::NowPlaying);
     }
 
     #[test]
@@ -579,6 +723,93 @@ mod tests {
         assert_eq!(sorted, vec!["a.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3"]);
         assert_eq!(after[0], current.display_filename(), "current stays head");
         assert_eq!(a.sync_ui().toast.as_deref(), Some("queue shuffled"));
+    }
+
+    #[test]
+    fn volume_and_toggles_mark_config_dirty() {
+        let (mut a, _) = app();
+        a.handle_action(Action::VolumeDown);
+        let cfg = a
+            .take_dirty_config()
+            .expect("volume change must dirty config");
+        assert!((cfg.volume() - 0.95).abs() < 1e-6);
+        assert!(a.take_dirty_config().is_none(), "dirty flag must reset");
+
+        a.handle_action(Action::ToggleArt);
+        let cfg = a.take_dirty_config().expect("art toggle must dirty config");
+        assert!(!cfg.art_enabled());
+        assert!(!a.sync_ui().art_enabled);
+
+        a.handle_action(Action::ToggleEq);
+        let cfg = a.take_dirty_config().expect("eq toggle must dirty config");
+        assert!(!cfg.eq_enabled());
+        assert!(
+            !a.sync_ui().eq_enabled,
+            "eq preview must hide when disabled"
+        );
+        assert!(
+            (a.config.volume() - 0.95).abs() < 1e-6,
+            "earlier volume change stays"
+        );
+    }
+
+    #[test]
+    fn toast_expires_after_three_seconds() {
+        let (mut a, dir) = app();
+        a.queue.append(vec![track_named(&dir, "s.mp3")]);
+        a.handle_action(Action::ClearQueue);
+        a.queue.append(vec![track_named(&dir, "again.mp3")]);
+        a.handle_action(Action::ShuffleQueue);
+        assert!(a.sync_ui().toast.is_some());
+        // Fast-forward: pretend the toast was set long ago.
+        a.toast_at = Some(std::time::Instant::now() - TOAST_DURATION - Duration::from_secs(1));
+        a.tick();
+        assert!(a.sync_ui().toast.is_none(), "toast must expire");
+    }
+
+    #[test]
+    fn toast_survives_within_lifetime() {
+        let (mut a, _) = app();
+        a.handle_action(Action::CycleRepeat);
+        a.tick();
+        assert_eq!(a.sync_ui().toast.as_deref(), Some("repeat: all"));
+    }
+
+    #[test]
+    fn search_cursor_walks_filtered_list_and_plays_the_marked_track() {
+        let (mut a, dir) = app();
+        a.queue.append(vec![
+            track_named(&dir, "alpha.mp3"),
+            track_named(&dir, "beach.flac"),
+            track_named(&dir, "beat.wav"),
+        ]);
+        a.handle_action(Action::StartSearch);
+        a.handle_action(Action::SearchChar('b'));
+        a.handle_action(Action::SearchChar('e'));
+        let ui = a.sync_ui();
+        assert_eq!(ui.queue.len(), 2, "filter shows beach+beat");
+        assert_eq!(ui.cursor, 0, "snap puts cursor on first match");
+        // Cursor moves inside the filtered subset (alpha is hidden).
+        a.handle_action(Action::CursorDown);
+        assert_eq!(a.sync_ui().cursor, 1);
+        a.handle_action(Action::CursorDown);
+        assert_eq!(a.sync_ui().cursor, 1, "clamped to filtered end");
+        // The track under the marker is what Enter plays.
+        a.handle_action(Action::ExitSearch);
+        a.handle_action(Action::PlaySelected);
+        assert_eq!(
+            a.engine.current().expect("cur").display_filename(),
+            "beat.wav"
+        );
+    }
+
+    #[test]
+    fn enqueue_scanned_appends_and_toasts() {
+        let (mut a, dir) = app();
+        let tracks = vec![track_named(&dir, "bg1.mp3"), track_named(&dir, "bg2.mp3")];
+        a.enqueue_scanned(tracks);
+        assert_eq!(a.queue.len(), 2);
+        assert_eq!(a.sync_ui().toast.as_deref(), Some("Queued 2 tracks"));
     }
 
     #[test]

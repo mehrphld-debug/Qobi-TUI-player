@@ -9,7 +9,8 @@ use qobi_lib::{
     error::QobiError,
     input::{Action, map_key, map_search_key},
     ipc::{self, IpcMessage},
-    library::{Queue, default_cache_path, save_cache, scan_with_cache, track_from_file},
+    keys,
+    library::{Queue, Track, default_cache_path, save_cache, scan_with_cache, track_from_file},
     tui::render,
 };
 
@@ -90,7 +91,20 @@ async fn become_secondary(sock: &std::path::Path, target: &Target) -> anyhow::Re
 
 /// First instance: seed queue, own playback, run the TUI event loop.
 async fn become_primary(listener: tokio::net::UnixListener, target: &Target) -> anyhow::Result<()> {
-    let cfg = Config::load().await?;
+    let mut cfg = Config::load().await?;
+    // An explicit directory becomes the configured music dir so a later
+    // bare `qobi` works (first-run setup per Architecture §8).
+    if let Target::Directory(dir) = target
+        && dir.is_dir()
+        && cfg.music_dir() != Some(dir.as_path())
+    {
+        cfg = cfg.with_music_dir(dir.clone());
+        if let Ok(path) = Config::config_path()
+            && let Err(e) = cfg.save(&path).await
+        {
+            tracing::warn!("config save failed: {e:#}");
+        }
+    }
     let seed_dir = match target {
         Target::DefaultDir => cfg.music_dir().map(std::path::Path::to_path_buf),
         Target::Directory(dir) => Some(dir.clone()),
@@ -134,16 +148,19 @@ async fn become_primary(listener: tokio::net::UnixListener, target: &Target) -> 
 
     let sink = RodioSink::new().map_err(|e| anyhow::anyhow!("no audio output device: {e:#}"))?;
     let engine = Engine::new(sink, cfg.volume());
-    let mut app = App::new(engine, queue, cache_path);
+    let mut app = App::new(engine, queue, cfg, cache_path.clone());
     app.autoplay();
-    run_tui(app, listener).await
+    run_tui(app, listener, cache_path).await
 }
 
 /// Live loop: keyboard (blocking reader thread) + IPC socket + 100ms tick.
-/// Terminal state is always restored, even on error.
+/// Terminal state is always restored, even on error **or panic** (the Drop
+/// guard runs during unwinding, so a crash can never leave the user's shell
+/// in raw mode / stuck in the alternate screen).
 async fn run_tui(
     mut app: App<RodioSink>,
     listener: tokio::net::UnixListener,
+    cache_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     use crossterm::{
         execute,
@@ -152,51 +169,100 @@ async fn run_tui(
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
-    let result = run_loop(&mut app, listener).await;
+    // Disarms only on clean exit; on panic/error Drop restores the terminal.
+    let guard = TerminalGuard::armed();
+    let result = run_loop(&mut app, listener, cache_path).await;
+    guard.disarm();
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     result
 }
 
+/// Restores raw mode + main screen when dropped without [`disarm`].
+struct TerminalGuard {
+    armed: bool,
+}
+
+impl TerminalGuard {
+    fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ =
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        }
+    }
+}
+
 async fn run_loop(
     app: &mut App<RodioSink>,
     listener: tokio::net::UnixListener,
+    cache_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
-    use crossterm::event::{Event, KeyEvent};
+    use crossterm::event::KeyEvent;
     use ratatui::{Terminal, backend::CrosstermBackend};
 
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
+    // Keyboard: dedicated OS thread. It polls for the app's whole lifetime —
+    // an idle timeout never ends it (regression: see keys::pump tests).
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
-    std::thread::spawn(move || {
-        while crossterm::event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
-            match crossterm::event::read() {
-                Ok(Event::Key(k)) => {
-                    if key_tx.send(k).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-    });
+    let _key_thread = keys::spawn_key_thread(key_tx);
 
+    // IPC: one task per connection (a flood can't starve the accept loop),
+    // and heavy dir scans run on the blocking pool (D4) — the UI stays live.
     let (ipc_tx, mut ipc_rx) = tokio::sync::mpsc::unbounded_channel::<IpcMessage>();
+    let (scan_tx, mut scan_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Track>>();
+    let ipc_cache_path = cache_path.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            match ipc::read_message(&mut stream).await {
-                Ok(Some(msg)) => {
-                    if ipc_tx.send(msg).is_err() {
-                        break;
+            let ipc_tx = ipc_tx.clone();
+            let scan_tx = scan_tx.clone();
+            let cache_path = ipc_cache_path.clone();
+            tokio::spawn(async move {
+                match ipc::read_message(&mut stream).await {
+                    Ok(Some(IpcMessage::EnqueueDir { path })) => {
+                        let tracks = tokio::task::spawn_blocking(move || {
+                            let (tracks, stats) = scan_with_cache(&path, &cache_path);
+                            tracing::info!(
+                                "scanned {}: {} tracks ({} cache hits, {} skipped)",
+                                path.display(),
+                                stats.tracks,
+                                stats.cache_hits,
+                                stats.skipped_errors
+                            );
+                            if let Err(e) = save_cache(&tracks, &cache_path) {
+                                tracing::warn!("cache save failed: {e}");
+                            }
+                            tracks
+                        })
+                        .await;
+                        match tracks {
+                            Ok(tracks) => {
+                                let _ = scan_tx.send(tracks);
+                            }
+                            Err(e) => tracing::warn!("dir scan task failed: {e:#}"),
+                        }
                     }
+                    Ok(Some(other)) => {
+                        let _ = ipc_tx.send(other);
+                    }
+                    Ok(None) => tracing::warn!("ipc: corrupt or oversized line ignored"),
+                    Err(e) => tracing::warn!("ipc read failed: {e:#}"),
                 }
-                Ok(None) => tracing::warn!("ipc: corrupt line ignored"),
-                Err(e) => tracing::warn!("ipc read failed: {e:#}"),
-            }
+            });
         }
     });
 
@@ -211,13 +277,35 @@ async fn run_loop(
                 } else {
                     map_key(k)
                 };
-                if app.handle_action(action) {
+                let quit = app.handle_action(action);
+                persist_config_if_dirty(app);
+                if quit {
                     return Ok(());
                 }
             }
-            Some(msg) = ipc_rx.recv() => app.handle_ipc(&msg),
+            Some(msg) = ipc_rx.recv() => {
+                app.handle_ipc(&msg);
+                persist_config_if_dirty(app);
+            }
+            Some(tracks) = scan_rx.recv() => app.enqueue_scanned(tracks),
             _ = ticker.tick() => app.tick(),
             else => return Ok(()),
         }
     }
+}
+
+/// Persist config changes (volume, toggles) flagged by the controller.
+/// Fire-and-forget: a failed save never disturbs playback.
+fn persist_config_if_dirty(app: &mut App<RodioSink>) {
+    let Some(cfg) = app.take_dirty_config() else {
+        return;
+    };
+    let Ok(path) = Config::config_path() else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(e) = cfg.save(&path).await {
+            tracing::warn!("config save failed: {e:#}");
+        }
+    });
 }
