@@ -8,4 +8,5 @@ pub mod input;
 pub mod ipc;
 pub mod keys;
 pub mod library;
+pub mod spectrum;
 pub mod tui;

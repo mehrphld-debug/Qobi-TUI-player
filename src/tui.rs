@@ -6,6 +6,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
+use crate::spectrum::EQ_BANDS;
+
 /// TUI views. `Browser` lands in Chunk D; C-min ships these three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum View {
@@ -35,6 +37,9 @@ pub struct UiState {
     pub cursor: usize,
     pub toast: Option<String>,
     pub eq_enabled: bool,
+    /// Live per-band levels 0..=1 for the current track position.
+    /// All zeros = analysis pending/unavailable (renders flat dim bars).
+    pub eq_bars: [f32; EQ_BANDS],
     /// Active search query (`None` = search mode off). Rendered, never edited here.
     pub search_query: Option<String>,
     /// Pre-rendered cover mosaic (fg-only cells). Empty = no art area.
@@ -55,6 +60,7 @@ impl Default for UiState {
             cursor: 0,
             toast: None,
             eq_enabled: true,
+            eq_bars: [0.0; EQ_BANDS],
             search_query: None,
             art: Vec::new(),
             art_enabled: true,
@@ -97,8 +103,20 @@ fn progress_line(progress: f32, elapsed: u64, total: Option<u64>, width: usize) 
         .collect();
     Line::from(vec![
         Span::styled(bar, accent()),
-        Span::styled(format!(" {label}"), dim()),
+        Span::styled(format!(" {label}"), Style::default()),
     ])
+}
+
+/// Live EQ row: 16 bars from per-band levels. Flat dim bars while the
+/// background analysis is pending; accent bars once audio data arrives.
+fn eq_line(bars: &[f32; EQ_BANDS]) -> Line<'static> {
+    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let live = bars.iter().any(|v| *v > 0.0);
+    let text: String = bars
+        .iter()
+        .map(|v| GLYPHS[(v.clamp(0.0, 1.0) * 7.0).round() as usize])
+        .collect();
+    Line::from(Span::styled(text, if live { accent() } else { dim() }))
 }
 
 fn tabs_line(active: View) -> Line<'static> {
@@ -117,12 +135,29 @@ fn tabs_line(active: View) -> Line<'static> {
     ])
 }
 
+/// How many cover rows fit: full 20-row mosaic on tall screens, a
+/// 12-row crop on medium ones, collapsed on short screens (art yields
+/// first per the responsive rule).
+fn art_row_budget(area_height: u16, art_len: usize) -> usize {
+    let budget = if area_height >= 26 {
+        art_len
+    } else if area_height >= 18 {
+        12.min(art_len)
+    } else {
+        0
+    };
+    budget.min(art_len)
+}
+
 fn render_now_playing(frame: &mut Frame, area: Rect, state: &UiState) {
     let mut rows: Vec<Line> = Vec::new();
     // Cover mosaic: collapses on short screens (responsive rule).
-    if state.art_enabled && area.height >= 18 && !state.art.is_empty() {
-        rows.extend(state.art.iter().take(12).cloned().map(|l| l.centered()));
-        rows.push(Line::from(""));
+    if state.art_enabled && !state.art.is_empty() {
+        let take = art_row_budget(area.height, state.art.len());
+        rows.extend(state.art.iter().take(take).cloned().map(|l| l.centered()));
+        if take > 0 {
+            rows.push(Line::from(""));
+        }
     }
     match &state.track {
         Some(track) => {
@@ -132,7 +167,7 @@ fn render_now_playing(frame: &mut Frame, area: Rect, state: &UiState) {
             )));
             rows.push(Line::from(Span::styled(
                 format!("{} — {}", track.artist, track.album),
-                dim(),
+                accent(),
             )));
         }
         None => rows.push(Line::from(Span::styled("nothing playing", dim()))),
@@ -146,10 +181,7 @@ fn render_now_playing(frame: &mut Frame, area: Rect, state: &UiState) {
     ));
     rows.push(Line::from(""));
     rows.push(if state.eq_enabled {
-        Line::from(Span::styled(
-            "▁▂▃▄▅▆▇█ ▂▄▆█▄▃▁ (eq preview — live in v0.2)",
-            dim(),
-        ))
+        eq_line(&state.eq_bars)
     } else {
         Line::from(Span::styled("(eq off)", dim()))
     });
@@ -210,7 +242,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Tab", "now playing / queue"),
     ("/", "search"),
     ("+", "- volume"),
-    ("e", "toggle eq preview"),
+    ("e", "toggle equalizer"),
     ("a", "toggle art"),
     ("c", "clear queue"),
     ("s", "shuffle queue"),
@@ -334,7 +366,19 @@ mod tests {
         let text = text_of(&draw(&s, 80, 24));
         assert!(text.contains("Atish Soozi"), "title missing:\n{text}");
         assert!(text.contains("1:02 / 4:08"), "time missing:\n{text}");
-        assert!(text.contains("eq preview"), "eq row missing:\n{text}");
+        assert!(text.contains("▁"), "eq row missing:\n{text}");
+    }
+
+    #[test]
+    fn eq_line_maps_levels_to_glyphs() {
+        let flat = eq_line(&[0.0; EQ_BANDS]);
+        let text: String = flat.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(text, "▁".repeat(EQ_BANDS));
+        let hot = eq_line(&[1.0; EQ_BANDS]);
+        let text: String = hot.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(text, "█".repeat(EQ_BANDS));
+        assert_eq!(hot.spans[0].style, accent());
+        assert_eq!(flat.spans[0].style, dim());
     }
 
     #[test]
@@ -399,14 +443,26 @@ mod tests {
         let mut s = demo_state();
         s.view = View::NowPlaying;
         s.art = placeholder(42, MOSAIC_W, MOSAIC_PIXEL_H).to_lines(true);
-        assert_eq!(s.art.len(), MOSAIC_H as usize, "24x24 px → 12 cell rows");
-        let buf = draw(&s, 80, 24);
+        assert_eq!(s.art.len(), MOSAIC_H as usize, "40x40 px → 20 cell rows");
+        // Tall screen: full 40x20 mosaic.
+        let buf = draw(&s, 80, 30);
         assert_transparent(&buf);
-        // The whole 24x12 mosaic renders as half-block cells.
         let on = text_of(&buf).chars().filter(|&c| c == '▀').count();
         assert_eq!(on, (MOSAIC_W * MOSAIC_H) as usize, "mosaic cells missing");
+        // Medium screen: 12-row crop.
+        let mid = text_of(&draw(&s, 80, 24))
+            .chars()
+            .filter(|&c| c == '▀')
+            .count();
+        assert_eq!(mid, (MOSAIC_W * 12) as usize, "medium crop missing");
+        // Short screen: art collapses entirely.
+        let tiny = text_of(&draw(&s, 80, 16))
+            .chars()
+            .filter(|&c| c == '▀')
+            .count();
+        assert_eq!(tiny, 0, "short screen must collapse art");
         s.art_enabled = false;
-        let off = text_of(&draw(&s, 80, 24))
+        let off = text_of(&draw(&s, 80, 30))
             .chars()
             .filter(|&c| c == '▀')
             .count();

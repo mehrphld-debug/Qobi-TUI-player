@@ -19,6 +19,8 @@ image = "0.25.10"
 lofty = "0.25.4"
 ratatui = "0.30.2"
 rodio = "0.22.2"
+rustfft = "6.4.1"
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "vorbis", "aac", "isomp4", "wav", "pcm"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"

@@ -10,9 +10,9 @@ use ratatui::{
 /// Disk cache budget for extracted covers (Chunk-Map §F).
 pub const ART_CACHE_CAP_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Mosaic size in terminal **cells**.
-pub const MOSAIC_W: u32 = 24;
-pub const MOSAIC_H: u32 = 12;
+/// Mosaic size in terminal **cells** (Architecture §5: max 40x20).
+pub const MOSAIC_W: u32 = 40;
+pub const MOSAIC_H: u32 = 20;
 
 /// Pixel sampling height: terminal cells are ~1:2 (w:h), so every cell
 /// renders **two** pixel rows via half-blocks. Sampling at
@@ -97,10 +97,17 @@ pub struct ArtImage {
 }
 
 /// Decode + thumbnail any `image`-supported bytes (png/jpeg/webp/bmp/…).
-/// Returns `None` for undecodable input.
+/// Center-crops to square, then downscales with Lanczos3 to the exact
+/// target size, so the mosaic is full-bleed and sharp instead of a
+/// small aspect-preserved stamp. Returns `None` for undecodable input.
 pub fn thumbnail(raw: &[u8], width: u32, height: u32) -> Option<ArtImage> {
-    let img = image::load_from_memory(raw).ok()?;
-    let thumb = img.thumbnail(width, height).to_rgb8();
+    use image::imageops::{FilterType, crop_imm, resize};
+    let img = image::load_from_memory(raw).ok()?.to_rgb8();
+    let side = img.width().min(img.height()).max(1);
+    let x = img.width().saturating_sub(side) / 2;
+    let y = img.height().saturating_sub(side) / 2;
+    let cropped = crop_imm(&img, x, y, side, side).to_image();
+    let thumb = resize(&cropped, width, height, FilterType::Lanczos3);
     let (w, h) = (thumb.width(), thumb.height());
     let pixels = thumb.pixels().map(|p| (p[0], p[1], p[2])).collect();
     Some(ArtImage {
@@ -350,11 +357,16 @@ mod tests {
     fn thumbnail_decodes_png_and_scales() {
         let raw = png_fixture(64, 32, (200, 40, 40));
         let thumb = thumbnail(&raw, 24, 12).expect("decode");
-        assert!(thumb.width <= 24 && thumb.height <= 12);
-        assert_eq!(thumb.pixels.len(), (thumb.width * thumb.height) as usize);
-        // Roughly red survives downscale.
-        let (r, g, b) = thumb.pixels[0];
-        assert!(r > 150 && g < 100 && b < 100);
+        // Square crop + exact Lanczos3 resize: always the requested size…
+        assert_eq!((thumb.width, thumb.height), (24, 12));
+        assert_eq!(thumb.pixels.len(), 24 * 12);
+        // …and a solid-red source stays red in every cell.
+        for (r, g, b) in &thumb.pixels {
+            assert!(
+                *r > 150 && *g < 100 && *b < 100,
+                "red must survive: {thumb:?}"
+            );
+        }
     }
 
     #[test]
@@ -472,7 +484,7 @@ mod tests {
 
     #[test]
     fn mosaic_sample_size_matches_cell_aspect() {
-        // 24x24 pixels render as 24x12 cells ≈ square on screen.
+        // 40x40 pixels render as 40x20 cells ≈ square on screen.
         assert_eq!(MOSAIC_PIXEL_H, 2 * MOSAIC_H);
         let img = placeholder(1, MOSAIC_W, MOSAIC_PIXEL_H);
         assert_eq!(img.to_lines_with(true, false).len(), MOSAIC_H as usize);

@@ -3,6 +3,7 @@ use crate::engine::{AudioSink, Engine, SEEK_STEP};
 use crate::input::Action;
 use crate::ipc::IpcMessage;
 use crate::library::{Queue, Track, track_from_file};
+use crate::spectrum::EQ_BANDS;
 use crate::tui::{TrackInfo, UiState, View};
 
 use ratatui::text::Line;
@@ -59,6 +60,32 @@ pub struct App<S: AudioSink> {
     cache_path: std::path::PathBuf,
     /// Memoized cover lines: (track key, lines). Decoding runs only on track change.
     art_memo: std::cell::RefCell<(Option<String>, Vec<Line<'static>>)>,
+    /// Background spectrum analysis: worker threads decode+FFT off the UI
+    /// thread and post timelines here; [`App::resolve_eq`] drains them.
+    spec_tx: std::sync::mpsc::Sender<(u64, Vec<[f32; EQ_BANDS]>)>,
+    spec_rx: std::sync::mpsc::Receiver<(u64, Vec<[f32; EQ_BANDS]>)>,
+    spec_state: std::cell::RefCell<SpecState>,
+}
+
+/// Spectrum cache for the current track.
+#[derive(Debug, Default)]
+struct SpecState {
+    /// Track key the cached timeline belongs to.
+    key: Option<u64>,
+    /// Track key with analysis in flight (spawned once per track).
+    pending: Option<u64>,
+    /// Per-100ms band vectors for [`SpecState::key`].
+    data: Vec<[f32; EQ_BANDS]>,
+}
+
+/// Cache identity shared with cover art: stable id + mtime + size.
+fn track_key(track: &Track) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    track.stable_id().hash(&mut h);
+    track.mtime_secs().hash(&mut h);
+    track.size().hash(&mut h);
+    h.finish()
 }
 
 impl<S: AudioSink> App<S> {
@@ -70,6 +97,7 @@ impl<S: AudioSink> App<S> {
     ) -> Self {
         let eq_enabled = config.eq_enabled();
         let art_enabled = config.art_enabled();
+        let (spec_tx, spec_rx) = std::sync::mpsc::channel();
         Self {
             engine,
             queue,
@@ -85,6 +113,9 @@ impl<S: AudioSink> App<S> {
             repeat: RepeatMode::Off,
             cache_path,
             art_memo: std::cell::RefCell::new((None, Vec::new())),
+            spec_tx,
+            spec_rx,
+            spec_state: std::cell::RefCell::new(SpecState::default()),
         }
     }
 
@@ -319,6 +350,7 @@ impl<S: AudioSink> App<S> {
             cursor,
             toast: self.toast.clone(),
             eq_enabled: self.eq_enabled,
+            eq_bars: self.resolve_eq(),
             search_query: self.search.clone(),
             art: self.resolve_art(),
             art_enabled: self.art_enabled,
@@ -365,7 +397,7 @@ impl<S: AudioSink> App<S> {
                 Some(raw)
             })
         });
-        // Sample at cell aspect (24x24 px → 24x12 cells): half-blocks render
+        // Sample at cell aspect (40x40 px → 40x20 cells): half-blocks render
         // two pixel rows per cell so the cover is square, not stretched.
         let img = bytes
             .as_deref()
@@ -374,6 +406,44 @@ impl<S: AudioSink> App<S> {
         let lines = img.to_lines(!monochrome());
         *self.art_memo.borrow_mut() = (Some(key), lines.clone());
         lines
+    }
+
+    /// Live EQ levels for the current playback position.
+    /// Analysis runs on a worker thread per track (spawned once); while it
+    /// is pending — or disabled, or the file is undecodable — this returns
+    /// flat zeros and the UI renders dim idle bars. Never blocks the UI.
+    fn resolve_eq(&self) -> [f32; EQ_BANDS] {
+        if !self.eq_enabled {
+            return [0.0; EQ_BANDS];
+        }
+        let Some(track) = self.engine.current() else {
+            return [0.0; EQ_BANDS];
+        };
+        let key = track_key(track);
+        let mut st = self.spec_state.borrow_mut();
+        for (k, timeline) in self.spec_rx.try_iter() {
+            if st.pending == Some(k) {
+                st.pending = None;
+            }
+            if k == key {
+                st.key = Some(k);
+                st.data = timeline;
+            }
+        }
+        if st.key != Some(key) && st.pending != Some(key) {
+            st.pending = Some(key);
+            let path = track.path().to_path_buf();
+            let tx = self.spec_tx.clone();
+            std::thread::spawn(move || {
+                let timeline = crate::spectrum::analyze(&path);
+                let _ = tx.send((key, timeline));
+            });
+            return [0.0; EQ_BANDS];
+        }
+        if st.key == Some(key) && !st.data.is_empty() {
+            return crate::spectrum::at_position(&st.data, self.engine.position());
+        }
+        [0.0; EQ_BANDS]
     }
 
     /// Queue indices that match the active search filter (all when not filtering).
@@ -648,7 +718,7 @@ mod tests {
         a.queue.append(vec![track_named(&dir, "s.mp3")]);
         a.handle_action(Action::PlaySelected);
         let ui = a.sync_ui();
-        assert_eq!(ui.art.len(), 12, "mosaic rows");
+        assert_eq!(ui.art.len(), 20, "mosaic rows");
         assert!(ui.art_enabled);
         // Memoized: second sync is identical without re-decoding.
         assert_eq!(a.sync_ui().art, ui.art);
