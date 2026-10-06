@@ -5,6 +5,8 @@ use std::time::SystemTime;
 use crate::cli::is_audio_file;
 
 /// A single scannable audio file. Metadata is best-effort: `None` until enriched.
+/// `year` / `format` joined in the ui-design pass (playlist + search tables);
+/// `#[serde(default)]` keeps pre-design index caches loadable.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     path: PathBuf,
@@ -14,6 +16,10 @@ pub struct Track {
     artist: Option<String>,
     album: Option<String>,
     duration_secs: Option<u64>,
+    #[serde(default)]
+    year: Option<u32>,
+    #[serde(default)]
+    format: Option<String>,
 }
 
 impl Track {
@@ -73,7 +79,33 @@ impl Track {
             artist: None,
             album: None,
             duration_secs: None,
+            year: None,
+            format: None,
         })
+    }
+
+    /// Codec/container label for the playlist + search tables.
+    /// `Mp4` covers both ALAC and AAC in `.m4a`, so it reports the honest
+    /// container label `M4A` rather than guessing a codec.
+    fn format_label(ft: lofty::file::FileType) -> String {
+        use lofty::file::FileType as F;
+        match ft {
+            F::Flac => "FLAC",
+            F::Mpeg => "MP3",
+            F::Vorbis => "OGG",
+            F::Opus => "OPUS",
+            F::Mp4 => "M4A",
+            F::Aac => "AAC",
+            F::Wav => "WAV",
+            F::Aiff => "AIFF",
+            F::Ape => "APE",
+            F::Mpc => "MPC",
+            F::Speex => "SPX",
+            F::WavPack => "WV",
+            F::Custom(s) => return s.to_ascii_uppercase(),
+            _ => return "???".to_string(),
+        }
+        .to_string()
     }
 
     /// Best-effort metadata enrichment via `lofty`. Never fails: garbage in → `None` fields.
@@ -82,6 +114,7 @@ impl Track {
         let Ok(tagged) = lofty::read_from_path(&self.path) else {
             return self;
         };
+        self.format = Some(Self::format_label(tagged.file_type()));
         let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
         if let Some(tag) = tag {
             use lofty::prelude::Accessor;
@@ -91,6 +124,7 @@ impl Track {
                 .map(|t| t.to_string())
                 .filter(|s| !s.is_empty());
             self.album = tag.album().map(|t| t.to_string()).filter(|s| !s.is_empty());
+            self.year = tag.date().map(|d| u32::from(d.year));
         }
         self.duration_secs = Some(tagged.properties().duration().as_secs());
         self
@@ -118,6 +152,33 @@ impl Track {
 
     pub fn display_album(&self) -> String {
         self.album().unwrap_or("Unknown album").to_string()
+    }
+
+    /// Release year for the playlist + search tables (`"----"` when unknown).
+    pub fn display_year(&self) -> String {
+        self.year
+            .map(|y| y.to_string())
+            .unwrap_or_else(|| "----".to_string())
+    }
+
+    /// Codec/container label. Falls back to the uppercased file extension
+    /// when enrichment never ran (e.g. WMA, which lofty cannot parse).
+    pub fn display_format(&self) -> String {
+        if let Some(f) = &self.format {
+            return f.clone();
+        }
+        self.path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_uppercase())
+            .unwrap_or_else(|| "???".to_string())
+    }
+
+    /// Track length as `m:ss` (`"--:--"` when unknown).
+    pub fn display_duration(&self) -> String {
+        self.duration_secs
+            .map(|d| format!("{}:{:02}", d / 60, d % 60))
+            .unwrap_or_else(|| "--:--".to_string())
     }
 
     /// File name for queue rows and toasts.

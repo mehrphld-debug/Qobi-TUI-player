@@ -30,4 +30,31 @@ First shippable slice: open → play → queue in the terminal.
 
 ## [Unreleased]
 
-- (empty — v0.2 planning starts after the v0.1.0 tag)
+Applies the `ui-design/` screens (visual restyle only — the keymap is frozen).
+
+### Added
+
+- Track metadata: release year (`lofty` tag date) and codec/container label
+  (`FLAC`/`MP3`/`OGG`/`OPUS`/`M4A`/`AAC`/`WAV`/…, extension fallback for
+  formats lofty cannot parse; old `index.json` caches still load)
+- Queue/search tables: title · artist · album · year · duration · format ·
+  stable `q01…` ids, `QUEUE <nn> tracks` + `repeat <mode>` header, dedicated
+  `SEARCH` section with match counts and `<filtered> / <total>`; search
+  matches raw title/artist/album/path (display fallbacks excluded)
+- Now Playing: centered column with playback status, mint EQ + timestamp,
+  centered key hints (bound keys only); Help regrouped into
+  `NAVIGATION / PLAYBACK / QUEUE / SESSION` with the offline-first footer
+
+### Changed
+
+- Accent ANSI cyan → mint `Rgb(126, 224, 176)` (+ amber queue ids) per the
+  designs; transparency invariant (fg-only, zero background fill) unchanged
+- Linear progress bar removed from Now Playing (progress lives in EQ + time)
+
+### Known deltas vs the mockups (deferred, not bugs)
+
+- No `p`/`n` prev/next, `j/k`, `gg/G`, `Ctrl+X`/`Ctrl+K`, `Q` queue, `a`
+  enqueue — keymap changes were out of scope; `a` still toggles cover art
+- Search keeps queue order (`sort: queue order`); no re-sort toggle
+- `.m4a` shows as `M4A` (container) rather than guessing `ALAC` vs `AAC`
+- Table needs ≥72 columns, else filename-only rows; art still collapses first

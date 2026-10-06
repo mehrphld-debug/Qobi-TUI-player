@@ -1,10 +1,10 @@
 use crate::config::Config;
-use crate::engine::{AudioSink, Engine, SEEK_STEP};
+use crate::engine::{AudioSink, Engine, PlayerState, SEEK_STEP};
 use crate::input::Action;
 use crate::ipc::IpcMessage;
 use crate::library::{Queue, Track, track_from_file};
 use crate::spectrum::EQ_BANDS;
-use crate::tui::{TrackInfo, UiState, View};
+use crate::tui::{Playback, TrackInfo, TrackRow, UiState, View};
 
 use ratatui::text::Line;
 
@@ -31,7 +31,7 @@ impl RepeatMode {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::All => "all",
@@ -317,6 +317,11 @@ impl<S: AudioSink> App<S> {
             artist: t.display_artist(),
             album: t.display_album(),
         });
+        let playback = match self.engine.state() {
+            PlayerState::Playing => Playback::Playing,
+            PlayerState::Paused => Playback::Paused,
+            _ => Playback::Stopped,
+        };
         let (progress, elapsed, total) = match self.engine.current() {
             Some(t) => {
                 let total = t.duration_secs();
@@ -334,18 +339,33 @@ impl<S: AudioSink> App<S> {
             }
             None => (0.0, 0, None),
         };
-        let names: Vec<String> = self
-            .filtered_tracks()
-            .iter()
-            .map(|t| t.display_filename())
+        let names: Vec<TrackRow> = self
+            .filtered_indices()
+            .into_iter()
+            .filter_map(|i| {
+                self.queue.get(i).map(|t| TrackRow {
+                    title: t.display_title(),
+                    artist: t.display_artist(),
+                    album: t.display_album(),
+                    year: t.display_year(),
+                    duration: t.display_duration(),
+                    format: t.display_format(),
+                    // Queue position id, stable across filtering so a
+                    // search row keeps the id it has in the Queue view.
+                    qid: format!("q{:02}", i + 1),
+                })
+            })
             .collect();
         let cursor = self.displayed_cursor();
         UiState {
             view: self.view,
             track,
+            playback,
             progress,
             elapsed_secs: elapsed,
             total_secs: total,
+            total_tracks: self.queue.len(),
+            repeat_label: self.repeat.label().to_string(),
             queue: names,
             cursor,
             toast: self.toast.clone(),
@@ -447,6 +467,7 @@ impl<S: AudioSink> App<S> {
     }
 
     /// Queue indices that match the active search filter (all when not filtering).
+    /// Matches across title, artist, album, and path per the search design.
     fn filtered_indices(&self) -> Vec<usize> {
         let all: Vec<usize> = (0..self.queue.len()).collect();
         let Some(q) = self.search.as_deref().filter(|q| !q.is_empty()) else {
@@ -457,16 +478,21 @@ impl<S: AudioSink> App<S> {
             .filter(|&i| {
                 self.queue
                     .get(i)
-                    .map(|t| t.display_filename().to_lowercase().contains(&needle))
+                    // Raw metadata only: the display fallbacks ("Unknown
+                    // artist/album") would match everyday bigrams like "al".
+                    .map(|t| {
+                        format!(
+                            "{} {} {} {}",
+                            t.title().unwrap_or_default(),
+                            t.artist().unwrap_or_default(),
+                            t.album().unwrap_or_default(),
+                            t.path().to_string_lossy()
+                        )
+                        .to_lowercase()
+                        .contains(&needle)
+                    })
                     .unwrap_or(false)
             })
-            .collect()
-    }
-
-    fn filtered_tracks(&self) -> Vec<&Track> {
-        self.filtered_indices()
-            .into_iter()
-            .filter_map(|i| self.queue.get(i))
             .collect()
     }
 
@@ -661,7 +687,10 @@ mod tests {
         a.handle_action(Action::SearchChar('l'));
         let ui = a.sync_ui();
         assert_eq!(ui.search_query.as_deref(), Some("al"));
-        assert_eq!(ui.queue, vec!["alpha.mp3".to_string()]);
+        assert_eq!(
+            ui.queue.iter().map(|r| r.title.clone()).collect::<Vec<_>>(),
+            vec!["alpha".to_string()]
+        );
         a.handle_action(Action::SearchBackspace);
         assert_eq!(a.sync_ui().search_query.as_deref(), Some("a"));
         a.handle_action(Action::ExitSearch);

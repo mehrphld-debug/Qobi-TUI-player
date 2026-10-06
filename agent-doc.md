@@ -1,11 +1,13 @@
 # Qobi Project — Agent Documentation
 
 ## Current Status
+- **Unreleased ui-design pass (2026-10-06, on `master`, pushed)**: `ui-design/` screens applied as a visuals-only restyle — centered Now Playing (status/EQ/time/hints), queue/search tables (year/format/qid columns, match counts), grouped Help. Keymap frozen by user decision (`p/n`, `j/k`, `gg/G`, `Ctrl+X/K`, `Q`, `a`=enqueue all deferred). 79 tests green (+1 ignored hw probe), clippy/fmt clean, binary reinstalled, live pty smoke on 106-track lib (scan → quit clean).
 - **v0.1.0 released 2026-09-23** (tag `v0.1.0`, pushed to `origin/master`): README + CHANGELOG shipped, release binary verified live on pty.
 - Requirements: `sys-p/0.md`, `sys-p/1.md`. Optimized plan: `sys-p/2.md`. Decisions locked in `PROJECT-CONTEXT.md`.
 - Next: v0.2 planning — live spectrum EQ, native Kitty/iTerm art, settings UI, dedup, brew/AUR, 20k bench, terminal matrix.
 
 ## Last Known Good State
+- Unreleased ui-design restyle on `master` 2026-10-06: 79 tests pass (+1 ignored hw probe), `clippy -D warnings` clean, `fmt --check` clean. Track carries `year` + `format` (serde-defaulted, old caches load); search matches raw title/artist/album/path. Designs committed under `ui-design/`; deltas documented in CHANGELOG Unreleased.
 - Chunks 0 + E + B + A + C-min + D + F-basic + H-min implemented and green 2026-09-23: 62 tests pass (+1 ignored hw probe), `clippy -D warnings` clean, `fmt --check` clean.
 - Live loop wired: `run_tui` (crossterm raw + alternate screen, key thread, IPC task, 100ms tick). pty smoke (100×30): boot → autoplay tone.wav → tabs + title + `0:00 / 0:01` + 290-cell mosaic, all bg=49 (transparent) → `q` quit clean.
 - Crate: `qobi` v0.1.0, modules `cli`/`config`/`engine`/`error`/`ipc`/`library`/`tui` in `src/`, bin `qobi` + lib `qobi_lib`. Deps add: rodio 0.22 (CoreAudio construct proven on this Mac via ignored probe test), ratatui 0.30 + crossterm 0.29.

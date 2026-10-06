@@ -17,6 +17,25 @@ pub enum View {
     Help,
 }
 
+/// Playback status for the Now Playing header (`ui-design/Main page.png`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Playback {
+    Playing,
+    Paused,
+    #[default]
+    Stopped,
+}
+
+impl Playback {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Playing => "▶ PLAYING",
+            Self::Paused => "‖ PAUSED",
+            Self::Stopped => "○ STOPPED",
+        }
+    }
+}
+
 /// Display-only track snapshot. The TUI never owns audio state (Chunk A owns it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackInfo {
@@ -25,15 +44,35 @@ pub struct TrackInfo {
     pub album: String,
 }
 
+/// One rendered playlist / search row (`ui-design/Playlist section.png`).
+/// Plain data — the TUI never owns library state (Chunk B owns it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackRow {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub year: String,
+    pub duration: String,
+    pub format: String,
+    /// Stable queue id (`q01`, `q02`, …) from the unfiltered queue position,
+    /// so filtered search rows keep the id they have in the Queue view.
+    pub qid: String,
+}
+
 /// Full UI state for one frame. Plain data — trivially snapshot-testable.
 #[derive(Debug, Clone)]
 pub struct UiState {
     pub view: View,
     pub track: Option<TrackInfo>,
+    pub playback: Playback,
     pub progress: f32,
     pub elapsed_secs: u64,
     pub total_secs: Option<u64>,
-    pub queue: Vec<String>,
+    pub queue: Vec<TrackRow>,
+    /// Unfiltered queue length, for the `QUEUE 03 tracks` / `8 / 324` headers.
+    pub total_tracks: usize,
+    /// Repeat mode label owned by the controller (`off` / `all` / `one`).
+    pub repeat_label: String,
     pub cursor: usize,
     pub toast: Option<String>,
     pub eq_enabled: bool,
@@ -53,10 +92,13 @@ impl Default for UiState {
         Self {
             view: View::NowPlaying,
             track: None,
+            playback: Playback::Stopped,
             progress: 0.0,
             elapsed_secs: 0,
             total_secs: None,
             queue: Vec::new(),
+            total_tracks: 0,
+            repeat_label: "off".to_string(),
             cursor: 0,
             toast: None,
             eq_enabled: true,
@@ -68,16 +110,22 @@ impl Default for UiState {
     }
 }
 
-/// Single accent, theme-aware by omission: every style below sets fg only,
-/// so the terminal background (transparent) always shows through.
+/// Mint accent from the ui-design screens. Theme-aware by omission: every
+/// style below sets fg only, so the terminal background (transparent) always
+/// shows through.
 fn accent() -> Style {
     Style::default()
-        .fg(Color::Cyan)
+        .fg(Color::Rgb(126, 224, 176))
         .add_modifier(Modifier::BOLD)
 }
 
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
+}
+
+/// Amber queue ids (`q01` …) from the playlist / search designs.
+fn amber() -> Style {
+    Style::default().fg(Color::Rgb(232, 184, 96))
 }
 
 fn warn() -> Style {
@@ -88,23 +136,39 @@ fn fmt_time(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-/// Thin progress bar from line-drawing cells (no widget background fill).
-fn progress_line(progress: f32, elapsed: u64, total: Option<u64>, width: usize) -> Line<'static> {
-    let ratio = progress.clamp(0.0, 1.0);
-    let label = format!(
-        "{} / {} ",
-        fmt_time(elapsed),
-        total.map(fmt_time).unwrap_or_else(|| "--:--".to_string())
-    );
-    let bar_width = width.saturating_sub(label.len()).max(4);
-    let filled = (ratio * bar_width as f32).round() as usize;
-    let bar: String = (0..bar_width)
-        .map(|i| if i < filled { '━' } else { '─' })
-        .collect();
+/// Centered `elapsed / total` timestamp from the Main page design.
+/// The linear bar is gone on purpose: progress lives in the EQ + timestamp.
+fn time_line(elapsed: u64, total: Option<u64>) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(
+            "{} / {}",
+            fmt_time(elapsed),
+            total.map(fmt_time).unwrap_or_else(|| "--:--".to_string())
+        ),
+        dim(),
+    ))
+    .centered()
+}
+
+/// Actual key hints, centered. Only keys that exist in the input map are
+/// advertised — the designs sketch `Prev [p]` / `Next [n]`, which have no
+/// binding (keymap changes were deferred), so they stay out of the hint.
+fn controls_hint() -> Line<'static> {
     Line::from(vec![
-        Span::styled(bar, accent()),
-        Span::styled(format!(" {label}"), Style::default()),
+        Span::styled("space", accent()),
+        Span::styled(" play/pause · ", dim()),
+        Span::styled("←/→", accent()),
+        Span::styled(" seek · ", dim()),
+        Span::styled("tab", accent()),
+        Span::styled(" queue · ", dim()),
+        Span::styled("/", accent()),
+        Span::styled(" search · ", dim()),
+        Span::styled("?", accent()),
+        Span::styled(" help · ", dim()),
+        Span::styled("q", accent()),
+        Span::styled(" quit", dim()),
     ])
+    .centered()
 }
 
 /// Live EQ row: 16 bars from per-band levels. Flat dim bars while the
@@ -150,6 +214,8 @@ fn art_row_budget(area_height: u16, art_len: usize) -> usize {
 }
 
 fn render_now_playing(frame: &mut Frame, area: Rect, state: &UiState) {
+    // Centered column per ui-design/Main page.png: cover → status → title →
+    // artist/album → EQ → timestamp → key hints.
     let mut rows: Vec<Line> = Vec::new();
     // Cover mosaic: collapses on short screens (responsive rule).
     if state.art_enabled && !state.art.is_empty() {
@@ -159,63 +225,194 @@ fn render_now_playing(frame: &mut Frame, area: Rect, state: &UiState) {
             rows.push(Line::from(""));
         }
     }
+    rows.push(Line::from(Span::styled(state.playback.label(), accent())).centered());
+    rows.push(Line::from(""));
     match &state.track {
         Some(track) => {
-            rows.push(Line::from(Span::styled(
-                track.title.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            rows.push(Line::from(Span::styled(
-                format!("{} — {}", track.artist, track.album),
-                accent(),
-            )));
+            rows.push(
+                Line::from(Span::styled(
+                    track.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .centered(),
+            );
+            rows.push(
+                Line::from(Span::styled(
+                    format!("{} — {}", track.artist, track.album),
+                    dim(),
+                ))
+                .centered(),
+            );
         }
-        None => rows.push(Line::from(Span::styled("nothing playing", dim()))),
+        None => rows.push(
+            Line::from(Span::styled(
+                "nothing playing — enqueue with qobi <file>",
+                dim(),
+            ))
+            .centered(),
+        ),
     }
     rows.push(Line::from(""));
-    rows.push(progress_line(
-        state.progress,
-        state.elapsed_secs,
-        state.total_secs,
-        area.width as usize,
-    ));
-    rows.push(Line::from(""));
-    rows.push(if state.eq_enabled {
-        eq_line(&state.eq_bars)
+    if state.eq_enabled {
+        rows.push(eq_line(&state.eq_bars).centered());
     } else {
-        Line::from(Span::styled("(eq off)", dim()))
-    });
-    frame.render_widget(Paragraph::new(rows), area);
+        rows.push(Line::from(Span::styled("(eq off)", dim())).centered());
+    }
+    rows.push(Line::from(""));
+    rows.push(time_line(state.elapsed_secs, state.total_secs));
+    rows.push(Line::from(""));
+    rows.push(controls_hint());
+    frame.render_widget(Paragraph::new(rows).centered(), area);
+}
+
+/// Pad or truncate a cell to exactly `width` chars (char-based; CJK may
+/// misalign by a cell — accepted, the previous renderer had the same limit).
+fn fit(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > width {
+        if width == 0 {
+            return String::new();
+        }
+        let mut t: String = chars[..width - 1].iter().collect();
+        t.push('…');
+        t
+    } else {
+        let mut t = s.to_string();
+        while t.chars().count() < width {
+            t.push(' ');
+        }
+        t
+    }
+}
+
+/// One line with a left and a right group (`QUEUE 03 tracks … repeat off`).
+/// The middle is space-filled; on overflow the left group wins and ratatui
+/// clips the rest — never a background fill, never a panic.
+fn sides(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let lw: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let rw: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let mut spans = left;
+    if lw + rw < width {
+        spans.push(Span::raw(" ".repeat(width - lw - rw)));
+    }
+    spans.extend(right);
+    Line::from(spans)
+}
+
+/// Fixed column widths for the playlist / search tables. Gaps are single
+/// spaces; the title column takes whatever is left (`width - FIXED_USED`).
+/// Below `WIDE_MIN` columns the table falls back to plain title rows.
+const WIDE_MIN: usize = 72;
+const FIXED_USED: usize = 64; // marker+num+artist+album+year+dur+fmt+qid+gaps
+
+fn track_line(row: &TrackRow, index: usize, current: bool, width: usize) -> Line<'static> {
+    let title_w = width.saturating_sub(FIXED_USED).max(8);
+    let num = format!("{:02}", index + 1);
+    let (marker, num_style) = if current {
+        (Span::styled("▸ ", accent()), accent())
+    } else {
+        (Span::styled("  ", dim()), dim())
+    };
+    let fmt_style = if row.format == "FLAC" {
+        accent()
+    } else {
+        dim()
+    };
+    Line::from(vec![
+        marker,
+        Span::styled(format!("{} ", fit(&num, 2)), num_style),
+        Span::styled(
+            format!("{} ", fit(&row.title, title_w)),
+            if current {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::styled(format!("{} ", fit(&row.artist, 14)), Style::default()),
+        Span::styled(format!("{} ", fit(&row.album, 18)), dim()),
+        Span::styled(format!("{} ", fit(&row.year, 4)), dim()),
+        Span::styled(format!("{} ", fit(&row.duration, 5)), dim()),
+        Span::styled(format!("{} ", fit(&row.format, 4)), fmt_style),
+        Span::styled(row.qid.clone(), amber()),
+    ])
+}
+
+/// Narrow-screen fallback: marker + title only, same as the pre-design rows.
+fn simple_line(title: &str, current: bool) -> Line<'static> {
+    if current {
+        Line::from(vec![
+            Span::styled("▸ ", accent()),
+            Span::styled(title.to_string(), accent()),
+        ])
+    } else {
+        Line::from(format!("  {title}"))
+    }
 }
 
 fn render_queue(frame: &mut Frame, area: Rect, state: &UiState) {
+    let width = area.width as usize;
     let mut top: Vec<Line> = Vec::new();
     if let Some(q) = &state.search_query {
-        top.push(Line::from(vec![
-            Span::styled("/", dim()),
-            Span::styled(q.clone(), Style::default().add_modifier(Modifier::BOLD)),
-        ]));
+        // Dedicated SEARCH section per ui-design/Search section.png.
+        top.push(Line::from(Span::styled("SEARCH", dim())));
+        top.push(sides(
+            vec![
+                Span::styled("/ ", accent()),
+                Span::styled(q.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("▏ in title, artist, album, path", dim()),
+            ],
+            vec![Span::styled(
+                format!("{} matches · esc clear", state.queue.len()),
+                dim(),
+            )],
+            width,
+        ));
+        top.push(Line::from(Span::styled("─".repeat(width.max(1)), accent())));
+        top.push(sides(
+            vec![Span::raw(format!(
+                "{} / {}",
+                state.queue.len(),
+                state.total_tracks
+            ))],
+            vec![Span::styled("sort: queue order", dim())],
+            width,
+        ));
+    } else {
+        top.push(sides(
+            vec![
+                Span::styled("QUEUE  ", dim()),
+                Span::raw(format!("{:02} tracks", state.total_tracks)),
+            ],
+            vec![Span::styled(
+                format!("repeat {}  shuffle off", state.repeat_label),
+                dim(),
+            )],
+            width,
+        ));
     }
     if state.queue.is_empty() {
         top.push(Line::from(Span::styled(
-            "(queue empty — enqueue with qobi <file>)",
+            if state.search_query.is_some() {
+                "(no matches — esc clears)"
+            } else {
+                "(queue empty — enqueue with qobi <file>)"
+            },
             dim(),
         )));
         frame.render_widget(Paragraph::new(top), area);
         return;
     }
+    let wide = width >= WIDE_MIN;
     let items: Vec<ListItem> = state
         .queue
         .iter()
         .enumerate()
-        .map(|(i, name)| {
-            let line = if i == state.cursor {
-                Line::from(vec![
-                    Span::styled("▸ ", accent()),
-                    Span::styled(name.clone(), accent()),
-                ])
+        .map(|(i, row)| {
+            let line = if wide {
+                track_line(row, i, i == state.cursor, width)
             } else {
-                Line::from(format!("  {name}"))
+                simple_line(&row.title, i == state.cursor)
             };
             ListItem::new(line)
         })
@@ -234,33 +431,65 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &UiState) {
     );
 }
 
-const HELP_ROWS: &[(&str, &str)] = &[
-    ("space", "play / pause"),
-    ("→ / ←", "seek ±5s"),
-    ("↑ / ↓", "navigate"),
-    ("Enter", "play selected"),
-    ("Tab", "now playing / queue"),
-    ("/", "search"),
-    ("+", "- volume"),
-    ("e", "toggle equalizer"),
-    ("a", "toggle art"),
-    ("c", "clear queue"),
-    ("s", "shuffle queue"),
-    ("r", "repeat off/all/one"),
-    ("?", "this help"),
-    ("q / Ctrl+C", "quit"),
+/// Grouped shortcut reference. Lists the real input map only — the designs
+/// sketch keys with no binding (`Ctrl+X`, `j/k`, …), which stay out until a
+/// keymap change lands.
+const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "NAVIGATION",
+        &[
+            ("tab", "now playing / queue"),
+            ("/", "search queue (esc exits)"),
+            ("↑ / ↓", "navigate"),
+            ("enter", "play selected"),
+        ],
+    ),
+    (
+        "PLAYBACK",
+        &[
+            ("space", "play / pause"),
+            ("→ / ←", "seek ±5s"),
+            ("+ / -", "volume"),
+            ("e", "toggle equalizer"),
+            ("a", "toggle cover art"),
+        ],
+    ),
+    (
+        "QUEUE",
+        &[
+            ("c", "clear queue"),
+            ("s", "shuffle queue"),
+            ("r", "repeat off → all → one"),
+        ],
+    ),
+    ("SESSION", &[("?", "this help"), ("q / Ctrl+C", "quit")]),
 ];
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let rows: Vec<Line> = HELP_ROWS
-        .iter()
-        .map(|(key, desc)| {
-            Line::from(vec![
+    let mut rows: Vec<Line> = vec![
+        Line::from(Span::styled("HELP", dim())),
+        Line::from(Span::raw(
+            "Qobi is a keyboard-first local music player. The main page stays \
+             focused on the current track, album cover, playing status, and \
+             equalizer. Search, queue, and help are separated into dedicated \
+             sections so the terminal stays readable and uncluttered.",
+        )),
+        Line::from(""),
+    ];
+    for (section, keys) in HELP_SECTIONS {
+        rows.push(Line::from(Span::styled(*section, dim())));
+        for (key, desc) in *keys {
+            rows.push(Line::from(vec![
                 Span::styled(format!("{key:<12}"), accent()),
-                Span::raw(*desc),
-            ])
-        })
-        .collect();
+                Span::styled((*desc).to_string(), dim()),
+            ]));
+        }
+        rows.push(Line::from(""));
+    }
+    rows.push(Line::from(Span::styled(
+        "Session and volume are saved locally. No telemetry is sent, and the player stays offline-first.",
+        dim(),
+    )));
     frame.render_widget(Paragraph::new(rows), area);
 }
 
@@ -296,6 +525,18 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn row(title: &str, format: &str, qid: &str) -> TrackRow {
+        TrackRow {
+            title: title.to_string(),
+            artist: "Someone".to_string(),
+            album: "Singles".to_string(),
+            year: "2024".to_string(),
+            duration: "3:12".to_string(),
+            format: format.to_string(),
+            qid: qid.to_string(),
+        }
+    }
+
     fn demo_state() -> UiState {
         UiState {
             track: Some(TrackInfo {
@@ -303,10 +544,13 @@ mod tests {
                 artist: "Someone".to_string(),
                 album: "Singles".to_string(),
             }),
+            playback: Playback::Playing,
             progress: 0.25,
             elapsed_secs: 62,
             total_secs: Some(248),
-            queue: vec!["a.mp3".to_string(), "b.flac".to_string()],
+            queue: vec![row("a", "MP3", "q01"), row("b", "FLAC", "q02")],
+            total_tracks: 2,
+            repeat_label: "off".to_string(),
             cursor: 0,
             toast: Some("Queued: c.mp3".to_string()),
             eq_enabled: true,
@@ -359,14 +603,16 @@ mod tests {
     }
 
     #[test]
-    fn now_playing_shows_track_and_progress() {
+    fn now_playing_shows_track_status_and_time() {
         let mut s = demo_state();
         s.view = View::NowPlaying;
         s.toast = None;
-        let text = text_of(&draw(&s, 80, 24));
+        let text = text_of(&draw(&s, 100, 30));
         assert!(text.contains("Atish Soozi"), "title missing:\n{text}");
+        assert!(text.contains("PLAYING"), "status missing:\n{text}");
         assert!(text.contains("1:02 / 4:08"), "time missing:\n{text}");
         assert!(text.contains("▁"), "eq row missing:\n{text}");
+        assert!(text.contains("play/pause"), "hints missing:\n{text}");
     }
 
     #[test]
@@ -385,12 +631,15 @@ mod tests {
     fn toast_and_empty_states() {
         let mut s = demo_state();
         s.view = View::Queue;
-        let text = text_of(&draw(&s, 80, 24));
+        let text = text_of(&draw(&s, 100, 24));
         assert!(text.contains("Queued: c.mp3"), "toast missing:\n{text}");
+        assert!(text.contains("QUEUE"), "queue header missing:\n{text}");
+        assert!(text.contains("repeat off"), "repeat label missing:\n{text}");
         assert!(
-            text.contains("a.mp3") && text.contains("b.flac"),
-            "queue missing:\n{text}"
+            text.contains("q01") && text.contains("q02"),
+            "qids missing:\n{text}"
         );
+        assert!(text.contains("FLAC"), "format column missing:\n{text}");
 
         let empty = UiState {
             view: View::Queue,
@@ -403,38 +652,62 @@ mod tests {
             view: View::NowPlaying,
             ..UiState::default()
         };
-        let text = text_of(&draw(&no_track, 80, 24));
+        let text = text_of(&draw(&no_track, 100, 30));
         assert!(
             text.contains("nothing playing"),
             "idle state missing:\n{text}"
         );
+        assert!(text.contains("STOPPED"), "idle status missing:\n{text}");
     }
 
     #[test]
     fn help_lists_shortcuts_and_eq_toggle() {
         let mut s = demo_state();
         s.view = View::Help;
-        let text = text_of(&draw(&s, 80, 24));
+        let text = text_of(&draw(&s, 100, 40));
         for key in [
-            "space", "seek", "search", "volume", "quit", "clear", "shuffle", "repeat", "Tab",
+            "space",
+            "seek",
+            "search",
+            "volume",
+            "quit",
+            "clear",
+            "shuffle",
+            "repeat",
+            "tab",
+            "NAVIGATION",
+            "PLAYBACK",
+            "QUEUE",
+            "SESSION",
+            "offline-first",
         ] {
             assert!(text.contains(key), "{key} missing from help:\n{text}");
         }
         s.view = View::NowPlaying;
         s.eq_enabled = false;
-        let text = text_of(&draw(&s, 80, 24));
+        let text = text_of(&draw(&s, 100, 30));
         assert!(text.contains("eq off"), "eq toggle missing:\n{text}");
     }
 
     #[test]
-    fn search_query_renders_in_queue() {
+    fn search_query_renders_search_section() {
         let mut s = demo_state();
         s.view = View::Queue;
         s.search_query = Some("al".to_string());
-        let buf = draw(&s, 80, 24);
+        let buf = draw(&s, 100, 24);
         assert_transparent(&buf);
         let text = text_of(&buf);
-        assert!(text.contains("/al"), "search row missing:\n{text}");
+        assert!(text.contains("SEARCH"), "search header missing:\n{text}");
+        assert!(text.contains("al"), "query missing:\n{text}");
+        assert!(
+            text.contains("in title, artist, album, path"),
+            "scope hint missing:\n{text}"
+        );
+        assert!(text.contains("matches"), "match count missing:\n{text}");
+        assert!(
+            text.contains("sort: queue order"),
+            "sort label missing:\n{text}"
+        );
     }
 
     #[test]

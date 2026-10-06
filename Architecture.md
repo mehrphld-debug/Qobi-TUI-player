@@ -48,10 +48,11 @@ cli (clap: qobi | qobi <dir> | qobi <file>)
 ## 5. TUI shell (ratatui + crossterm)
 
 - Views (tabs): `Now Playing | Queue | Browser | Help`. Queue tab is where enqueued tracks appear (D2 tracking requirement).
-- Now Playing: art (centered, max 40x20 cells, aspect kept) → track title/artist/album → progress bar + time → EQ bars (16/24, toggleable).
-- Queue: list with cursor, `Queued: <name>` toast 3s on IPC enqueue, no view steal.
-- Browser: directory picker + search input (`/`), multi-select (space) + `Enter` to enqueue/play.
-- Help: `?` full shortcut map (also satisfies onboarding).
+- Now Playing (ui-design/Main page.png): centered column — art (centered, max 40x20 cells, aspect kept) → playback status (`▶ PLAYING` / `‖ PAUSED` / `○ STOPPED`) → title (bold) / artist — album (dim) → EQ bars (16, toggleable) → `elapsed / total` timestamp → centered key hints. No linear progress bar by design; progress lives in the EQ + timestamp.
+- Queue (ui-design/Playlist section.png): header `QUEUE <nn> tracks` + `repeat <mode>  shuffle off`; table rows `▸ nn title artist album year duration format qid` (≥72 cols, title flexes, cells truncated with `…`), filename-only fallback below that. Playing row number mint, `FLAC` mint / other formats dim, `qid` (`q01`…) amber and stable across search filtering.
+- Search (ui-design/Search section.png): dedicated section while filtering — `SEARCH` header, `/ <query>▏ in title, artist, album, path` + `<n> matches · esc clear`, mint divider, `<filtered> / <total>` + `sort: queue order` (queue order is kept; no re-sort). Matches raw title/artist/album/path (display fallbacks excluded so everyday bigrams don't match everything).
+- Help (ui-design/Help section.png): `HELP` header + intro paragraph, grouped `NAVIGATION / PLAYBACK / QUEUE / SESSION` sections listing the real input map only, offline-first footer.
+- Input: keyboard-first. Map is **frozen** (ui-design pass was visuals-only): `space play/pause, →/← seek ±5s, ↑/↓ navigate, Enter play selected, Tab now playing/queue, / search (esc exits), q quit, ? help, +/- volume, e EQ toggle, a art toggle, c clear queue, s shuffle, r repeat`. The designs sketch `p/n` prev/next, `j/k`, `gg/G`, `Ctrl+X/K`, `Q` queue, `a` enqueue — all deferred to a future keymap change; the hint lines advertise bound keys only.
 - Rendering rules: **never set background fill** — transparent by omission. All panels `Style::default()` bg `Reset`. Theme-aware: derive fg from terminal (light/dark detect via `$COLORFGBG` fallback dark). Minimum 80x24, responsive shrink (art collapses first).
 - Input: keyboard-first. Draft map (audit vs terminal before scaffold): `space play/pause, →/← seek ±5s, ↑/↓ navigate, Enter play selected, space select, / search, q quit, ? help, +/- volume, e EQ toggle, a art toggle, c clear queue, s shuffle, r repeat`. `Ctrl+C` = quit (terminal standard). `Ctrl+P/X` from old spec **rejected** (shell conflicts) — remapped above.
 - Mouse: secondary only. Hover over EQ = highlight bar + tooltip band freq; click = nothing destructive. Disabled when `crossterm` mouse unsupported.
@@ -70,7 +71,7 @@ cli (clap: qobi | qobi <dir> | qobi <file>)
 
 No CSS exists (greenfield) — tokens derived from Apple/Notion + transparency constraint. No gradients, no glassmorphism, no gratuitous rounding (TUI has no rounding; use thin borders `─│┌┐└┘` sparingly).
 
-- `color.bg`: `transparent` (never fill). `color.fg`: `terminal-fg`. `color.dim`: `terminal-fg 60%`. `color.accent`: `terminal ANSI cyan` (single accent, follows theme). `color.warn`: `ANSI yellow/red` only for errors/toasts.
+- `color.bg`: `transparent` (never fill). `color.fg`: `terminal-fg`. `color.dim`: `terminal-fg 60%`. `color.accent`: mint `Rgb(126, 224, 176)` bold (ui-design; was ANSI cyan). `color.qid`: amber `Rgb(232, 184, 96)` for queue ids. `color.warn`: `ANSI yellow/red` only for errors/toasts.
 - `type.title`: bold, 1 line. `type.body`: normal. `type.caption`: dim. Hierarchy: title > progress/time > list > caption. No custom fonts (terminal font wins).
 - `space.unit`: 1 cell. Rhythm: 1/2/4 cells padding. Breathing room: art gets ≥2 cells margin; list density comfortable (1 line per track).
 - `motion.eq`: 30fps max, pauses when paused/muted; respects `NO_COLOR` + settings toggle.

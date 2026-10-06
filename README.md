@@ -13,9 +13,11 @@ queue, and what's playing — all without leaving the terminal.
 - **Instant local playback** — `qobi`, `qobi <dir>`, `qobi <file>`; auto-plays first track
 - **Single instance** — a second `qobi <file>` enqueues into the running player, never opens a new window
 - **Transparent TUI** — no background fill, follows your terminal theme (Apple/Notion-inspired restraint)
+- **Now Playing** — centered cover, `▶ PLAYING` / `‖ PAUSED` / `○ STOPPED` status, live EQ, `elapsed / total`, key hints
 - **Cover mosaic** — embedded art where present (cached, 500 MiB LRU), deterministic placeholder covers otherwise
-- **Queue** — cursor play, clear, shuffle, repeat off/all/one, `/` filter search
-- **Keyboard-first** — full map below, `?` help page built in
+- **Queue table** — title · artist · album · year · duration · format (`FLAC` highlighted) · stable `q01…` ids, `repeat` status in the header
+- **Queue** — cursor play, clear, shuffle, repeat off/all/one, `/` search across title, artist, album, and path with match counts
+- **Keyboard-first** — full map below, `?` help page built in (grouped sections)
 - **Offline & private** — no network, no daemon, config in `~/.config/qobi/`
 
 ## Install
@@ -154,7 +156,7 @@ qobi other-song.mp3  # → "Queued: other-song.mp3" in the running player
 ## Building & testing
 
 ```sh
-cargo test                          # 60+ unit + snapshot tests
+cargo test                          # 79 unit + snapshot tests
 cargo test -- --ignored rodio       # hardware audio probe (needs a device)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
