@@ -120,7 +120,22 @@ fn decode_mono(path: &Path) -> Option<(Vec<f32>, u32)> {
         if packet.track_id() != track_id {
             continue;
         }
-        let decoded = decoder.decode(&packet).ok()?;
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            // Truncated tail: stop cleanly and keep every sample decoded so far.
+            Err(symphonia::core::errors::Error::IoError(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            // One corrupt frame must not kill the whole analysis. The old
+            // `decoder.decode(&packet).ok()?` discarded everything decoded
+            // so far, which left these tracks' EQ permanently flat.
+            Err(e) => {
+                tracing::debug!("spectrum: skipping undecodable packet: {e}");
+                continue;
+            }
+        };
         if rate.is_none() {
             rate = decoded.spec().rate.into();
         }
@@ -278,6 +293,31 @@ mod tests {
         }
         // 440Hz with 40Hz..16k log edges lands in band 6 (378..550Hz).
         assert_eq!(peak_band, Some(6));
+    }
+
+    #[test]
+    fn truncated_file_keeps_partial_timeline() {
+        // A file cut off mid-stream (bad download, torn write) must still
+        // animate the decodable prefix — never a permanently flat EQ.
+        let dir = std::env::temp_dir().join("qobi-spec-trunc");
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let full = sine_wav(&dir, "full.wav", 440.0, 8);
+        let bytes = std::fs::read(&full).expect("read");
+        let cut = dir.join("cut.wav");
+        std::fs::write(&cut, &bytes[..bytes.len() / 2]).expect("write");
+        let partial = analyze(&cut);
+        assert!(
+            !partial.is_empty(),
+            "truncated file must keep its decodable prefix"
+        );
+        assert!(
+            partial.len() < 80,
+            "partial timeline must be shorter than the full 80 windows"
+        );
+        assert!(
+            partial.iter().all(|w| w.iter().any(|&v| v > 0.0)),
+            "every kept window must carry signal"
+        );
     }
 
     #[test]

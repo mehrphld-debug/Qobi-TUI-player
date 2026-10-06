@@ -1,13 +1,14 @@
 # Qobi Project — Agent Documentation
 
 ## Current Status
+- **Unreleased bugfix pass (2026-10-06, on `master`, pushed)**: three reported defects fixed with evidence — (1) cover cropped mid-image on short screens → scale-to-fit mosaic (row sampling + color averaging), narrow-screen hint, no doubled hints; (2) `Enter` in search only exited → now plays the match (`ConfirmSearch`, `no matches` toast on empty); (3) EQ flat on some tracks → corrupt packets skipped instead of aborting analysis (3/106 real-library tracks flatlined, now full timelines) + panic-proof worker. 84 tests green (+1 ignored hw probe), clippy/fmt clean, binary reinstalled, pty smoke ok.
 - **Unreleased ui-design pass (2026-10-06, on `master`, pushed)**: `ui-design/` screens applied as a visuals-only restyle — centered Now Playing (status/EQ/time/hints), queue/search tables (year/format/qid columns, match counts), grouped Help. Keymap frozen by user decision (`p/n`, `j/k`, `gg/G`, `Ctrl+X/K`, `Q`, `a`=enqueue all deferred). 79 tests green (+1 ignored hw probe), clippy/fmt clean, binary reinstalled, live pty smoke on 106-track lib (scan → quit clean).
 - **v0.1.0 released 2026-09-23** (tag `v0.1.0`, pushed to `origin/master`): README + CHANGELOG shipped, release binary verified live on pty.
 - Requirements: `sys-p/0.md`, `sys-p/1.md`. Optimized plan: `sys-p/2.md`. Decisions locked in `PROJECT-CONTEXT.md`.
 - Next: v0.2 planning — live spectrum EQ, native Kitty/iTerm art, settings UI, dedup, brew/AUR, 20k bench, terminal matrix.
 
 ## Last Known Good State
-- Unreleased ui-design restyle on `master` 2026-10-06: 79 tests pass (+1 ignored hw probe), `clippy -D warnings` clean, `fmt --check` clean. Track carries `year` + `format` (serde-defaulted, old caches load); search matches raw title/artist/album/path. Designs committed under `ui-design/`; deltas documented in CHANGELOG Unreleased.
+- Unreleased bugfix restyle on `master` 2026-10-06: 84 tests pass (+1 ignored hw probe), `clippy -D warnings` clean, `fmt --check` clean. Temporary `examples/probe_*` diagnosis harnesses removed after use. Known probe evidence: 3/106 real MP3s yielded empty spectrum timelines pre-fix (post-fix full); `Paiiz-catchy.mp3` stays empty (unparseable, correctly skipped at playback).
 - Chunks 0 + E + B + A + C-min + D + F-basic + H-min implemented and green 2026-09-23: 62 tests pass (+1 ignored hw probe), `clippy -D warnings` clean, `fmt --check` clean.
 - Live loop wired: `run_tui` (crossterm raw + alternate screen, key thread, IPC task, 100ms tick). pty smoke (100×30): boot → autoplay tone.wav → tabs + title + `0:00 / 0:01` + 290-cell mosaic, all bg=49 (transparent) → `q` quit clean.
 - Crate: `qobi` v0.1.0, modules `cli`/`config`/`engine`/`error`/`ipc`/`library`/`tui` in `src/`, bin `qobi` + lib `qobi_lib`. Deps add: rodio 0.22 (CoreAudio construct proven on this Mac via ignored probe test), ratatui 0.30 + crossterm 0.29.

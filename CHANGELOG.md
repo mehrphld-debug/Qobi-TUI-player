@@ -30,6 +30,25 @@ First shippable slice: open → play → queue in the terminal.
 
 ## [Unreleased]
 
+### Fixed
+
+- Cover art on short screens: the mosaic scales to fit (even row sampling
+  with pinned endpoints + half-block color averaging) instead of cropping
+  mid-image — the whole cover stays visible at 80x24 and the art hides only
+  on truly tiny screens; over-narrow terminals also shrink it instead of
+  line-wrapping it into noise
+- Search selection: `Enter` on a match now plays it and leaves search mode
+  (previously `Enter` only exited search, so picking music took two Enters);
+  `Enter` on zero matches toasts `no matches` and plays nothing
+- Live EQ going permanently flat on some tracks: one corrupt audio packet
+  used to abort the whole background analysis and discard every sample
+  decoded so far (3 of 106 tracks in a real library flatlined this way).
+  Bad packets are now skipped (truncated tails stop cleanly), partial
+  results are kept, and a panicking analysis can no longer wedge a track's
+  EQ flat forever
+- Now Playing hints: short form on narrow screens (no mid-hint wrapping) and
+  the bottom status line no longer repeats the in-content hints
+
 Applies the `ui-design/` screens (visual restyle only — the keymap is frozen).
 
 ### Added

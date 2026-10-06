@@ -143,7 +143,7 @@ qobi other-song.mp3  # → "Queued: other-song.mp3" in the running player
 | `→` / `←` | seek ±5s |
 | `↑` / `↓` | navigate queue |
 | `Enter` | play selected |
-| `/` | search queue (`Esc`/`Enter` exits) |
+| `/` | search queue (`Enter` plays match, `Esc` exits) |
 | `+` / `-` | volume |
 | `e` | toggle equalizer |
 | `a` | toggle cover art |

@@ -153,22 +153,37 @@ fn time_line(elapsed: u64, total: Option<u64>) -> Line<'static> {
 /// Actual key hints, centered. Only keys that exist in the input map are
 /// advertised — the designs sketch `Prev [p]` / `Next [n]`, which have no
 /// binding (keymap changes were deferred), so they stay out of the hint.
-fn controls_hint() -> Line<'static> {
-    Line::from(vec![
-        Span::styled("space", accent()),
-        Span::styled(" play/pause · ", dim()),
-        Span::styled("←/→", accent()),
-        Span::styled(" seek · ", dim()),
-        Span::styled("tab", accent()),
-        Span::styled(" queue · ", dim()),
-        Span::styled("/", accent()),
-        Span::styled(" search · ", dim()),
-        Span::styled("?", accent()),
-        Span::styled(" help · ", dim()),
-        Span::styled("q", accent()),
-        Span::styled(" quit", dim()),
-    ])
-    .centered()
+/// Narrow screens get the short form so the line never wraps mid-hint.
+fn controls_hint(width: usize) -> Line<'static> {
+    if width >= 78 {
+        Line::from(vec![
+            Span::styled("space", accent()),
+            Span::styled(" play/pause · ", dim()),
+            Span::styled("←/→", accent()),
+            Span::styled(" seek · ", dim()),
+            Span::styled("tab", accent()),
+            Span::styled(" queue · ", dim()),
+            Span::styled("/", accent()),
+            Span::styled(" search · ", dim()),
+            Span::styled("?", accent()),
+            Span::styled(" help · ", dim()),
+            Span::styled("q", accent()),
+            Span::styled(" quit", dim()),
+        ])
+        .centered()
+    } else {
+        Line::from(vec![
+            Span::styled("space", accent()),
+            Span::styled(" play/pause · ", dim()),
+            Span::styled("tab", accent()),
+            Span::styled(" queue · ", dim()),
+            Span::styled("/", accent()),
+            Span::styled(" search · ", dim()),
+            Span::styled("q", accent()),
+            Span::styled(" quit", dim()),
+        ])
+        .centered()
+    }
 }
 
 /// Live EQ row: 16 bars from per-band levels. Flat dim bars while the
@@ -199,30 +214,126 @@ fn tabs_line(active: View) -> Line<'static> {
     ])
 }
 
-/// How many cover rows fit: full 20-row mosaic on tall screens, a
-/// 12-row crop on medium ones, collapsed on short screens (art yields
-/// first per the responsive rule).
-fn art_row_budget(area_height: u16, art_len: usize) -> usize {
-    let budget = if area_height >= 26 {
-        art_len
-    } else if area_height >= 18 {
-        12.min(art_len)
+/// How many cover rows fit: the whole mosaic scales to the space left by
+/// the Now Playing chrome instead of cropping mid-image (the old rule cut
+/// the cover to 12/20 rows at 80x24, which read as a broken picture).
+/// Chrome = status+title+artist+EQ+time+hints+blanks (11 rows when a track
+/// is loaded); below [`ART_MIN_ROWS`] the mosaic stops reading as a picture
+/// and hides entirely.
+const NP_CHROME_ROWS: u16 = 11;
+const ART_MIN_ROWS: usize = 4;
+
+/// Scale the mosaic to fit `max_rows` × `max_width` cells: rows are evenly
+/// sampled with endpoints pinned (first and last always survive), and
+/// over-wide rows merge adjacent cell pairs by averaging their half-block
+/// colors, so the whole cover stays visible on short/narrow screens.
+/// Monochrome density runes merge by keeping the denser of the pair.
+fn fit_art(lines: &[Line<'static>], max_rows: usize, max_width: usize) -> Vec<Line<'static>> {
+    if lines.is_empty() || max_rows == 0 || max_width == 0 {
+        return Vec::new();
+    }
+    let n = lines.len();
+    let take = max_rows.min(n);
+    let idx: Vec<usize> = if take >= n {
+        (0..n).collect()
+    } else if take == 1 {
+        vec![0]
     } else {
-        0
+        // (n-1)/(take-1) >= 1, so indices are strictly increasing.
+        (0..take).map(|i| i * (n - 1) / (take - 1)).collect()
     };
-    budget.min(art_len)
+    idx.into_iter()
+        .map(|i| shrink_line(&lines[i], max_width))
+        .collect()
+}
+
+/// Halve a row's width by merging adjacent cell pairs until it fits.
+/// A trailing odd cell survives as-is; exact trim keeps the image start.
+fn shrink_line(line: &Line<'static>, max_width: usize) -> Line<'static> {
+    let mut spans = line.spans.clone();
+    while spans.len() > max_width && spans.len() > 1 {
+        spans = spans.chunks(2).map(merge_pair).collect();
+    }
+    spans.truncate(max_width);
+    Line::from(spans)
+}
+
+fn merge_pair(pair: &[Span<'static>]) -> Span<'static> {
+    let [a, b] = pair else {
+        return pair.first().cloned().unwrap_or_else(|| Span::raw(""));
+    };
+    if a.content == "▀" && b.content == "▀" {
+        Span::styled(
+            "▀",
+            Style::default()
+                .fg(avg_color(a.style.fg, b.style.fg))
+                .bg(avg_color(a.style.bg, b.style.bg)),
+        )
+    } else {
+        // Density runes (monochrome mode): the denser cell wins.
+        if rune_density(&b.content) > rune_density(&a.content) {
+            b.clone()
+        } else {
+            a.clone()
+        }
+    }
+}
+
+fn rune_density(s: &str) -> u8 {
+    match s {
+        "█" => 4,
+        "▓" => 3,
+        "▒" => 2,
+        "░" => 1,
+        "▀" => 2,
+        _ => 0,
+    }
+}
+
+/// Average two cell colors in RGB space. Stays in the 256-palette when both
+/// sides are indexed (256-color terminals must never receive truecolor);
+/// a missing side takes the present color, both missing stay `Reset`.
+fn avg_color(a: Option<Color>, b: Option<Color>) -> Color {
+    use crate::art::{ansi256_to_rgb, rgb_to_ansi256};
+    let rgb = |c: Color| match c {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Indexed(i) => Some(ansi256_to_rgb(i)),
+        _ => None,
+    };
+    let mid = |(x, y): ((u8, u8, u8), (u8, u8, u8))| {
+        let m = |p: u8, q: u8| ((u16::from(p) + u16::from(q)) / 2) as u8;
+        (m(x.0, y.0), m(x.1, y.1), m(x.2, y.2))
+    };
+    match (a.and_then(rgb), b.and_then(rgb)) {
+        (Some(x), Some(y)) => {
+            let (r, g, bl) = mid((x, y));
+            match (a, b) {
+                (Some(Color::Indexed(_)), Some(Color::Indexed(_))) => {
+                    Color::Indexed(rgb_to_ansi256(r, g, bl))
+                }
+                _ => Color::Rgb(r, g, bl),
+            }
+        }
+        (Some(_), None) => a.unwrap_or(Color::Reset),
+        (None, Some(_)) => b.unwrap_or(Color::Reset),
+        (None, None) => Color::Reset,
+    }
 }
 
 fn render_now_playing(frame: &mut Frame, area: Rect, state: &UiState) {
     // Centered column per ui-design/Main page.png: cover → status → title →
     // artist/album → EQ → timestamp → key hints.
     let mut rows: Vec<Line> = Vec::new();
-    // Cover mosaic: collapses on short screens (responsive rule).
+    // Cover mosaic: scales the whole picture to the space left by the
+    // chrome (collapses entirely when too little is left).
     if state.art_enabled && !state.art.is_empty() {
-        let take = art_row_budget(area.height, state.art.len());
-        rows.extend(state.art.iter().take(take).cloned().map(|l| l.centered()));
-        if take > 0 {
-            rows.push(Line::from(""));
+        let budget = area.height.saturating_sub(NP_CHROME_ROWS) as usize;
+        if budget >= ART_MIN_ROWS {
+            let fitted = fit_art(&state.art, budget, area.width as usize);
+            if !fitted.is_empty() {
+                rows.extend(fitted.into_iter().map(|l| l.centered()));
+                rows.push(Line::from(""));
+            }
         }
     }
     rows.push(Line::from(Span::styled(state.playback.label(), accent())).centered());
@@ -261,7 +372,7 @@ fn render_now_playing(frame: &mut Frame, area: Rect, state: &UiState) {
     rows.push(Line::from(""));
     rows.push(time_line(state.elapsed_secs, state.total_secs));
     rows.push(Line::from(""));
-    rows.push(controls_hint());
+    rows.push(controls_hint(area.width as usize));
     frame.render_widget(Paragraph::new(rows).centered(), area);
 }
 
@@ -439,7 +550,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "NAVIGATION",
         &[
             ("tab", "now playing / queue"),
-            ("/", "search queue (esc exits)"),
+            ("/", "search queue (enter plays, esc exits)"),
             ("↑ / ↓", "navigate"),
             ("enter", "play selected"),
         ],
@@ -512,6 +623,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     }
     let status = match &state.toast {
         Some(t) => Line::from(Span::styled(t.clone(), warn())),
+        // Now Playing carries its own centered hints in-content; repeating
+        // the generic hint here doubled it (spotted on a 60x15 capture).
+        None if state.view == View::NowPlaying => Line::from(""),
         None => Line::from(Span::styled(
             "space play/pause · tab queue · / search · ? help · q quit",
             dim(),
@@ -711,35 +825,99 @@ mod tests {
     }
 
     #[test]
-    fn art_renders_centered_and_transparent() {
+    fn art_scales_to_fit_instead_of_cropping() {
         use crate::art::{MOSAIC_H, MOSAIC_PIXEL_H, MOSAIC_W, placeholder};
         let mut s = demo_state();
         s.view = View::NowPlaying;
         s.art = placeholder(42, MOSAIC_W, MOSAIC_PIXEL_H).to_lines(true);
         assert_eq!(s.art.len(), MOSAIC_H as usize, "40x40 px → 20 cell rows");
-        // Tall screen: full 40x20 mosaic.
-        let buf = draw(&s, 80, 30);
-        assert_transparent(&buf);
-        let on = text_of(&buf).chars().filter(|&c| c == '▀').count();
-        assert_eq!(on, (MOSAIC_W * MOSAIC_H) as usize, "mosaic cells missing");
-        // Medium screen: 12-row crop.
-        let mid = text_of(&draw(&s, 80, 24))
-            .chars()
-            .filter(|&c| c == '▀')
-            .count();
-        assert_eq!(mid, (MOSAIC_W * 12) as usize, "medium crop missing");
-        // Short screen: art collapses entirely.
-        let tiny = text_of(&draw(&s, 80, 16))
-            .chars()
-            .filter(|&c| c == '▀')
-            .count();
-        assert_eq!(tiny, 0, "short screen must collapse art");
+        let cells = |state: &UiState, w: u16, h: u16| {
+            text_of(&draw(state, w, h))
+                .chars()
+                .filter(|&c| c == '▀')
+                .count()
+        };
+        // Tall screen: full 40x20 mosaic, untouched (content 38 − chrome 11
+        // leaves room for all 20 rows).
+        assert_eq!(cells(&s, 120, 40), (MOSAIC_W * MOSAIC_H) as usize);
+        assert_eq!(cells(&s, 80, 30), MOSAIC_W as usize * 17);
+        // 80x24 (content 22, chrome 11): scaled 20 → 11 rows, 440 cells —
+        // and the full picture survives: first scaled row is the original
+        // first row, last scaled row the original last.
+        assert_eq!(cells(&s, 80, 24), (MOSAIC_W * 11) as usize);
+        let fitted = fit_art(&s.art, 11, 80);
+        assert_eq!(fitted.len(), 11);
+        assert_eq!(fitted[0].spans, s.art[0].spans, "top must survive");
+        assert_eq!(
+            fitted[10].spans,
+            s.art[MOSAIC_H as usize - 1].spans,
+            "bottom must survive"
+        );
+        // Tiny screen: art hides instead of showing a 2-row smear.
+        assert_eq!(cells(&s, 80, 16), 0);
+        assert!(fit_art(&s.art, 3, 80).len() <= 3);
         s.art_enabled = false;
-        let off = text_of(&draw(&s, 80, 30))
-            .chars()
-            .filter(|&c| c == '▀')
-            .count();
-        assert_eq!(off, 0, "toggle must hide art entirely");
+        assert_eq!(cells(&s, 120, 40), 0, "toggle must hide art entirely");
+    }
+
+    #[test]
+    fn fit_art_merges_overwide_rows_by_averaging_colors() {
+        use ratatui::style::Color;
+        let wide = Line::from(vec![
+            Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(200, 0, 0))
+                    .bg(Color::Rgb(0, 0, 0)),
+            ),
+            Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(100, 0, 0))
+                    .bg(Color::Rgb(0, 0, 0)),
+            ),
+            Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(0, 0, 200))
+                    .bg(Color::Rgb(0, 0, 0)),
+            ),
+            Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(0, 0, 100))
+                    .bg(Color::Rgb(0, 0, 0)),
+            ),
+        ]);
+        let out = fit_art(&[wide], 4, 2);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].spans.len(), 2, "4 cells → 2 merged cells");
+        assert_eq!(out[0].spans[0].content, "▀");
+        assert_eq!(
+            out[0].spans[0].style.fg,
+            Some(Color::Rgb(150, 0, 0)),
+            "pair average, not a crop"
+        );
+        // Transparency invariant holds through merges: bg only on ▀ cells.
+        let buf = draw(
+            &UiState {
+                view: View::NowPlaying,
+                art: out,
+                ..UiState::default()
+            },
+            80,
+            30,
+        );
+        assert_transparent(&buf);
+    }
+
+    #[test]
+    fn fit_art_handles_degenerate_inputs() {
+        assert!(fit_art(&[], 10, 80).is_empty());
+        assert!(fit_art(&[Line::from("x")], 0, 80).is_empty());
+        assert!(fit_art(&[Line::from("x")], 10, 0).is_empty());
+        let one = fit_art(&[Line::from("x")], 1, 80);
+        assert_eq!(one.len(), 1);
     }
 
     #[test]

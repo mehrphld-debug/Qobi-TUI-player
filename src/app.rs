@@ -181,6 +181,17 @@ impl<S: AudioSink> App<S> {
                 self.snap_cursor_to_filter();
             }
             Action::ExitSearch => self.search = None,
+            Action::ConfirmSearch => {
+                // `Enter` on a match plays it immediately — previously `Enter`
+                // only left search mode, so selecting music took two Enters
+                // and read as "can't select from search".
+                if self.filtered_indices().is_empty() {
+                    self.set_toast("no matches");
+                } else {
+                    self.play_selected();
+                }
+                self.search = None;
+            }
             Action::ClearQueue => {
                 self.queue.clear();
                 self.set_toast("queue cleared");
@@ -455,7 +466,11 @@ impl<S: AudioSink> App<S> {
             let path = track.path().to_path_buf();
             let tx = self.spec_tx.clone();
             std::thread::spawn(move || {
-                let timeline = crate::spectrum::analyze(&path);
+                // Never leave `pending` stuck: a panicking analysis would
+                // otherwise wedge this track's EQ flat forever (the UI only
+                // clears `pending` on receive).
+                let timeline = std::panic::catch_unwind(|| crate::spectrum::analyze(&path))
+                    .unwrap_or_default();
                 let _ = tx.send((key, timeline));
             });
             return [0.0; EQ_BANDS];
@@ -872,6 +887,44 @@ mod tests {
         a.handle_action(Action::CycleRepeat);
         a.tick();
         assert_eq!(a.sync_ui().toast.as_deref(), Some("repeat: all"));
+    }
+
+    #[test]
+    fn search_enter_plays_match_and_exits_search() {
+        let (mut a, dir) = app();
+        a.queue.append(vec![
+            track_named(&dir, "alpha.mp3"),
+            track_named(&dir, "beach.flac"),
+            track_named(&dir, "beat.wav"),
+        ]);
+        a.handle_action(Action::StartSearch);
+        a.handle_action(Action::SearchChar('b'));
+        a.handle_action(Action::SearchChar('e'));
+        a.handle_action(Action::CursorDown); // beach -> beat
+        assert_eq!(a.sync_ui().cursor, 1);
+        a.handle_action(Action::ConfirmSearch);
+        let ui = a.sync_ui();
+        assert_eq!(ui.search_query, None, "search mode must exit");
+        assert_eq!(
+            a.engine.current().expect("cur").display_filename(),
+            "beat.wav",
+            "Enter must play the marked match"
+        );
+    }
+
+    #[test]
+    fn search_enter_on_empty_filter_toasts_and_plays_nothing() {
+        let (mut a, dir) = app();
+        a.queue.append(vec![track_named(&dir, "alpha.mp3")]);
+        a.handle_action(Action::StartSearch);
+        a.handle_action(Action::SearchChar('z'));
+        a.handle_action(Action::SearchChar('z'));
+        assert!(a.sync_ui().queue.is_empty());
+        a.handle_action(Action::ConfirmSearch);
+        let ui = a.sync_ui();
+        assert_eq!(ui.search_query, None);
+        assert_eq!(ui.toast.as_deref(), Some("no matches"));
+        assert!(a.engine.current().is_none(), "nothing must play");
     }
 
     #[test]

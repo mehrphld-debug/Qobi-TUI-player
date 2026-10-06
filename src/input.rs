@@ -20,6 +20,9 @@ pub enum Action {
     StartSearch,
     SearchChar(char),
     SearchBackspace,
+    /// `Enter` while searching: play the selected match and leave search mode.
+    /// (`Esc` still just exits via [`Action::ExitSearch`].)
+    ConfirmSearch,
     ExitSearch,
     ClearQueue,
     ShuffleQueue,
@@ -59,8 +62,9 @@ pub fn map_key(key: KeyEvent) -> Action {
     }
 }
 
-/// Map a key while search mode is active: typing edits the query,
-/// `Enter`/`Esc` leave search mode, arrows still navigate results.
+/// Map a key while search mode is active: typing edits the query, `Enter`
+/// plays the match under the cursor, `Esc` leaves search mode, arrows still
+/// navigate results.
 pub fn map_search_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -69,7 +73,8 @@ pub fn map_search_key(key: KeyEvent) -> Action {
         };
     }
     match key.code {
-        KeyCode::Esc | KeyCode::Enter => Action::ExitSearch,
+        KeyCode::Enter => Action::ConfirmSearch,
+        KeyCode::Esc => Action::ExitSearch,
         KeyCode::Backspace => Action::SearchBackspace,
         KeyCode::Char(c) => Action::SearchChar(c),
         KeyCode::Up => Action::CursorUp,
@@ -148,7 +153,7 @@ mod tests {
             map_search_key(key(KeyCode::Backspace)),
             Action::SearchBackspace
         );
-        assert_eq!(map_search_key(key(KeyCode::Enter)), Action::ExitSearch);
+        assert_eq!(map_search_key(key(KeyCode::Enter)), Action::ConfirmSearch);
         assert_eq!(map_search_key(key(KeyCode::Esc)), Action::ExitSearch);
         assert_eq!(map_search_key(key(KeyCode::Up)), Action::CursorUp);
         assert_eq!(map_search_key(ctrl(KeyCode::Char('c'))), Action::Quit);
